@@ -1,0 +1,465 @@
+nebconfigbegin
+sr,48000
+ksmps,32
+-b,512
+-B,2048
+freeze,latching,rising
+reset,triggered,rising
+nebconfigend
+
+; Perverse Engineering is an attempt to recrate Make Noise Echophon for Nebulae V2
+;
+; Mapping:
+; pitch   : Pitch Shift (-2 to +2 Octaves) [gkpitch]
+; speed   : Delay Time (Exponential, 7ms to 1.7s) [gkspeed]
+; start   : Depth (Pitch index / grain head window size) [gkloopstart]
+; size    : Feedback Mix (Bipolar: Loop 1 <-> Loop 2) [gkloopsize]
+; density : Feedback Amount (Loop 1 - Spiraling) [gkdensity]
+; overlap : Feedback Amount (Loop 2 - Standard) [gkoverlap]
+; blend   : Dry/Wet Mix [gkblend]
+; freeze  : Buffer Freeze (stops writing; Echo Time re-addresses held audio destructively) [gkfreeze]
+; reset   : Clock Sync / Reset [gkreset]
+; start_alt : Input Gain (Exponential, -12dB to +6dB)
+; window_alt : Loop 1 Feedback Tone (Exponential cutoff, 2500Hz–20000Hz)
+;
+; Internal Architecture:
+; - 16-bit delay storage emulation
+; - Tempophon-inspired dual-grain pitch shifter
+; - Dual independent feedback loops
+;   Loop 1: post-pitch spiraling path with light tone damping
+;   Loop 2: cleaner pre-pitch echo path
+
+; Shared stereo memory
+; 1.7s @ 48kHz = 81600 samples. 131072 is next power of 2.
+giBufL ftgen 1, 0, 131072, 2, 0
+giBufR ftgen 2, 0, 131072, 2, 0
+giBufLen = ftlen(giBufL)
+
+giWin ftgen 3, 0, 4096, 20, 3
+
+; Hardware Jitter Prevention: Deadband for sensitive knobs
+opcode Deadband, k, kk
+    kin, kprev xin
+    kdiff = abs(kin - kprev)
+    ; Threshold 0.005 (approx 1/200th of knob travel)
+    kout = (kdiff > 0.005 ? kin : kprev)
+    xout kout
+endop
+
+instr 1
+; --- 0. Initialize Audio-rate Variables  ---
+ainL init 0
+ainR init 0
+aPitchOutL init 0
+aPitchOutR init 0
+aFB_Loop1L init 0
+aFB_Loop1R init 0
+aFB_Loop2L init 0
+aFB_Loop2R init 0
+aInL_Pre init 0
+aInR_Pre init 0
+aInL_Clean init 0
+aInR_Clean init 0
+aInL_Q init 0
+aInR_Q init 0
+aFreezeOffset init 0
+aWriteIdx init 0
+aReadPosRaw init 0
+aTapIdx init 0
+aTapL init 0
+aTapR init 0
+aPhOld1 init 0
+aPhOld2 init 0
+aPhNew1 init 0
+aPhNew2 init 0
+aIdx1 init 0
+aIdx2 init 0
+aWin1 init 0
+aWin2 init 0
+aOutL init 0
+aOutR init 0
+
+; --- 1. Retrieve Controls ---
+gkpitch chnget "pitch"
+gkspeed chnget "speed"
+gkloopstart chnget "start"
+gkloopsize chnget "size"
+gkdensity chnget "density"
+gkoverlap chnget "overlap"
+gkblend chnget "blend"
+gkfreeze chnget "freeze"
+gkreset chnget "reset"
+
+; --- 1. Audio Input ---
+#ifdef RUNNER_INPUT_FILE
+  iFileChn filenchnls $RUNNER_INPUT_FILE
+  if iFileChn > 1 then
+      ainL, ainR diskin2 $RUNNER_INPUT_FILE, 1, 0, 1
+  else
+      ainL diskin2 $RUNNER_INPUT_FILE, 1, 0, 1
+      ainR = ainL
+  endif
+#else
+  ainL inch 1
+  ainR inch 2
+#endif
+
+; Input Gain Control (via start_alt)
+; Eurorack levels require attenuation before hitting the delay buffer
+gkstart_alt chnget "start_alt"
+kInGainCtl portk gkstart_alt, 0.08
+; Maps 0..1 to an exponential curve from 0.25 (-12dB) to 2.0 (+6dB)
+kInGain = exp(log(0.25) + (limit(kInGainCtl, 0, 1) * (log(2.0) - log(0.25))))
+
+ainL = ainL * kInGain
+ainR = ainR * kInGain
+
+; --- 2. Controls & Parameters ---
+; Clock Sync Logic
+kResetTrig trigger gkreset, 0.5, 0
+kTimer init 0
+kClockSamples init 0
+kTimer = kTimer + ksmps
+
+if kResetTrig == 1 then
+    kInterval = kTimer
+    kTimer = 0
+
+    ; Snap immediately on each pulse — no averaging, matches hardware behaviour
+    if kInterval > (0.02 * sr) then
+        kClockSamples = kInterval
+    endif
+else
+    ; Timeout: If no pulse for > 2 seconds, return to independent mode
+    if kTimer > (2.0 * sr) then
+        kClockSamples = 0
+    endif
+endif
+
+; --- 2. Controls & Parameters ---
+
+kPitchRaw init 0.5
+kSpeedRaw init 0.5
+kSizeRaw init 0.5
+kDensityRaw init 0.3
+kOverlapRaw init 0.3
+kStartRaw init 0.3
+
+kPitchRaw Deadband gkpitch, kPitchRaw
+kSpeedRaw Deadband gkspeed, kSpeedRaw
+kSizeRaw Deadband gkloopsize, kSizeRaw
+kDensityRaw Deadband gkdensity, kDensityRaw
+kOverlapRaw Deadband gkoverlap, kOverlapRaw
+kStartRaw Deadband gkloopstart, kStartRaw
+
+; Delay Time: 7ms to 1.7s (Exponential)
+iMinTime = 0.007
+iMaxTime = 1.7
+kTimeCtlRaw portk kSpeedRaw, 0.05
+kTimeRaw = exp(log(iMinTime) + (kTimeCtlRaw * (log(iMaxTime) - log(iMinTime))))
+
+; Tempo Sync: If we have a valid clock, snap to divisions/multiples
+if kClockSamples > 0 then
+    ; Hardware clock ratios: 1/16, 3/32, 1/8, 3/16, 1/4, 3/8, 1/2, 3/4, 1/1, 3/2, 2/1, 3/1, 4/1, 6/1, 8/1, 12/1
+    kDivisions[] fillarray 0.0625, 0.09375, 0.125, 0.1875, 0.25, 0.375, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0
+    kMinDiff = 1000000 ; Reset every cycle to allow knob movement
+    kSnappedTime = kTimeRaw
+    kIndex = 0
+    while kIndex < lenarray(kDivisions) do
+        kCandidate = (kClockSamples / sr) * kDivisions[kIndex]
+        kDiff = abs(kCandidate - kTimeRaw)
+        if kDiff < kMinDiff then
+            kMinDiff = kDiff
+            kSnappedTime = kCandidate
+        endif
+        kIndex = kIndex + 1
+    od
+    kTimeTarget = kSnappedTime
+else
+    kTimeTarget = kTimeRaw
+endif
+
+; Keep a small amount of smoothing for stability without erasing most time-change motion
+kTime portk kTimeTarget, 0.01
+; Limit to buffer size
+kTime = limit(kTime, iMinTime, iMaxTime)
+kTimeSamples = kTime * sr
+
+; Audio-rate interpolation — portk 0.08 above already prevents zipper noise
+aTimeSamples interp kTimeSamples
+
+; Depth: Grain Size (Window Size) AND Pitch VCA
+; Manual: "Depth sets the index of pitch shifting... at 7:00 there is no Pitch Shifting"
+; Depth acts as a VCA for the pitch control voltages — scales deviation from unity
+kDepthCtl portk kStartRaw, 0.05
+
+; Pitch Shift: -2 to +2 Octaves
+; Depth scales the semitone deviation: at Depth=0, kSemitones=0 = no pitch shift
+kPitchCtlRaw portk kPitchRaw, 0.05
+kTargetSemitones = (kPitchCtlRaw - 0.5) * 48 * kDepthCtl
+kTargetPitchRatio = pow(2, kTargetSemitones / 12)
+
+; Retune the shifter by crossfading old/new states instead of live-warping the active engine.
+; This is specific to the start/depth path, which is zipper-prone on hardware when interp drives
+; grain cadence directly.
+kTargetGrainSize = 0.005 + (kDepthCtl * 0.07)
+kTargetGrainSamples = kTargetGrainSize * sr
+kShDepthOld init 0.0
+kShDepthNew init 0.0
+kShGrainOld init 0.0
+kShGrainNew init 0.0
+kShPitchOld init 1.0
+kShPitchNew init 1.0
+kShXfade init 1.0
+kShInitDone init 0.0
+
+if kShInitDone < 0.5 then
+    kShDepthOld = kDepthCtl
+    kShDepthNew = kDepthCtl
+    kShGrainOld = kTargetGrainSamples
+    kShGrainNew = kTargetGrainSamples
+    kShPitchOld = kTargetPitchRatio
+    kShPitchNew = kTargetPitchRatio
+    kShXfade = 1.0
+    kShInitDone = 1.0
+endif
+
+kShCurrDepth = (kShDepthOld * (1.0 - kShXfade)) + (kShDepthNew * kShXfade)
+kShCurrGrain = (kShGrainOld * (1.0 - kShXfade)) + (kShGrainNew * kShXfade)
+kShCurrPitch = (kShPitchOld * (1.0 - kShXfade)) + (kShPitchNew * kShXfade)
+if abs(kDepthCtl - kShDepthNew) > 0.01 then
+    kShDepthOld = kShCurrDepth
+    kShGrainOld = kShCurrGrain
+    kShPitchOld = kShCurrPitch
+    kShDepthNew = kDepthCtl
+    kShGrainNew = kTargetGrainSamples
+    kShPitchNew = kTargetPitchRatio
+    kShXfade = 0.0
+endif
+if kShXfade < 1.0 then
+    kShXfade = min(kShXfade + (ksmps / (0.012 * sr)), 1.0)
+endif
+
+; Feedback Mix & Amounts
+; The hardware has one knob, we use size as a crossfader between Loop 1 and Loop 2
+kFBMixCtl portk kSizeRaw, 0.05 
+; 0.0 to 0.5: Loop 1 fades out, Loop 2 is 0
+; 0.5 to 1.0: Loop 1 is 0, Loop 2 fades in
+if (kFBMixCtl < 0.5) then
+    kLoop1Mix = (0.5 - kFBMixCtl) * 2.0
+    kLoop2Mix = 0.0
+else
+    kLoop1Mix = 0.0
+    kLoop2Mix = (kFBMixCtl - 0.5) * 2.0
+endif
+
+; Interpolate feedback gains to a-rate to prevent zipper noise
+aLoop1Mix interp kLoop1Mix
+aLoop2Mix interp kLoop2Mix
+
+kLoop1FB portk kDensityRaw, 0.05
+kLoop2FB portk kOverlapRaw, 0.05
+aLoop1FB interp kLoop1FB
+aLoop2FB interp kLoop2FB
+
+; Feedback tone (window_alt) now darkens Loop 1 only; Loop 2 stays cleaner
+gkwindow_alt chnget "window_alt"
+kToneCtl portk gkwindow_alt, 0.05
+; Loop 1 only: keep tone shaping much lighter so the spiraling path stays articulate
+kLoop1Cutoff = exp(log(2500) + (kToneCtl * (log(20000) - log(2500))))
+
+; Freeze
+kFreeze = gkfreeze
+kFreezeTrig trigger kFreeze, 0.5, 0
+kPrevTimeSamples init 0
+
+; Destructive Editing during Freeze
+; "The Echo Time parameter changes the sound destructively"
+aFreezeOffset init 0
+if kFreeze > 0.5 then
+    ; Hold the frozen chamber while letting Echo Time re-address it destructively.
+    ; During freeze the write head keeps advancing, so offset by that motion only.
+    aFreezeOffset = wrap(aFreezeOffset + a(ksmps), 0, giBufLen)
+endif
+kPrevTimeSamples = kTimeSamples
+
+; --- 2. Delay Line Read & Pitch Shifter ---
+
+; Use a-rate phasor for write head
+aWritePhs phasor (sr / giBufLen)
+aWriteIdx = aWritePhs * giBufLen
+
+; Read "behind" the write head, adding freeze offset
+aReadPosRaw = aWriteIdx - aTimeSamples + aFreezeOffset
+
+; Loop 2 (Standard Echo) Tap
+; table3 with iwrap=1 handles negative and out-of-bounds indices with cubic interpolation
+aTapL table3 aReadPosRaw, giBufL, 0, 0, 1
+aTapR table3 aReadPosRaw, giBufR, 0, 0, 1
+denorm aTapL, aTapR
+
+; === Feedback Governor ===
+; Keep unity recirculation available at the top of each feedback knob, then pull the
+; shared loop down only when the recirculated signal is actually near clipping.
+aLoopAbs = max(abs(aTapL), abs(aTapR))
+kLoopAbs downsamp aLoopAbs
+kLoopEnv init 0.0
+if kLoopAbs > kLoopEnv then
+    kLoopEnv = (0.18 * kLoopAbs) + (0.82 * kLoopEnv)
+else
+    kLoopEnv = (0.02 * kLoopAbs) + (0.98 * kLoopEnv)
+endif
+kGovNorm = limit((kLoopEnv - 0.96) / 0.12, 0, 1)
+kFbCtrlTarget = 1.0 - (kGovNorm * 0.10)
+kFbCtrlTarget limit kFbCtrlTarget, 0.90, 1.0
+kFbCtrl init 1.0
+kFbCtrl portk kFbCtrlTarget, 0.05
+
+; Top-zone sustain compensation so either feedback loop can hold at full CW.
+; Loop 2 gets a larger lift because its DD-3-like path is cleaner / less self-smearing.
+kLoop1HoldNorm = limit((kLoop1FB - 0.84) / 0.16, 0, 1)
+kLoop2HoldNorm = limit((kLoop2FB - 0.84) / 0.16, 0, 1)
+kLoop1HoldGain = 1.0 + (kLoop1HoldNorm * 0.24)
+kLoop2HoldGain = 1.0 + (kLoop2HoldNorm * 0.34)
+aLoop1HoldGain interp kLoop1HoldGain
+aLoop2HoldGain interp kLoop2HoldGain
+
+; Tempophon-style pitch shifter with start/depth retimed by old/new-state crossfade
+kHeadRateOld = abs(kShPitchOld - 1.0) * (sr / max(kShGrainOld, 1.0))
+kHeadRateNew = abs(kShPitchNew - 1.0) * (sr / max(kShGrainNew, 1.0))
+kSlipDirOld = (kShPitchOld >= 1.0 ? 1.0 : -1.0)
+kSlipDirNew = (kShPitchNew >= 1.0 ? 1.0 : -1.0)
+kUnityBlendOld = min(abs(kShPitchOld - 1.0) * 16.0, 1.0)
+kUnityBlendNew = min(abs(kShPitchNew - 1.0) * 16.0, 1.0)
+
+aGrainOld interp kShGrainOld
+aGrainNew interp kShGrainNew
+aHeadRateOld interp kHeadRateOld
+aHeadRateNew interp kHeadRateNew
+aSlipDirOld interp kSlipDirOld
+aSlipDirNew interp kSlipDirNew
+aUnityBlendOld interp kUnityBlendOld
+aUnityBlendNew interp kUnityBlendNew
+aPitchDepthOld interp kShDepthOld
+aPitchDepthNew interp kShDepthNew
+aShXfade interp kShXfade
+aShOldGain = cos(aShXfade * ($M_PI / 2))
+aShNewGain = sin(aShXfade * ($M_PI / 2))
+
+; Old state
+aPhOld1 phasor aHeadRateOld
+aPhOld2 phasor aHeadRateOld, 0.5
+aOffsetOld1 = (aPhOld1 - 0.5) * aGrainOld * aSlipDirOld
+aOffsetOld2 = (aPhOld2 - 0.5) * aGrainOld * aSlipDirOld
+aReadOld1L table3 (aReadPosRaw + aOffsetOld1), giBufL, 0, 0, 1
+aReadOld1R table3 (aReadPosRaw + aOffsetOld1), giBufR, 0, 0, 1
+aReadOld2L table3 (aReadPosRaw + aOffsetOld2), giBufL, 0, 0, 1
+aReadOld2R table3 (aReadPosRaw + aOffsetOld2), giBufR, 0, 0, 1
+denorm aReadOld1L, aReadOld1R, aReadOld2L, aReadOld2R
+aWinOld1 = 0.5 - (0.5 * cos(aPhOld1 * ($M_PI * 2)))
+aWinOld2 = 0.5 - (0.5 * cos(aPhOld2 * ($M_PI * 2)))
+aPitchHeadOldL = (aReadOld1L * aWinOld1) + (aReadOld2L * aWinOld2)
+aPitchHeadOldR = (aReadOld1R * aWinOld1) + (aReadOld2R * aWinOld2)
+aPitchOldL = (aTapL * (1 - aUnityBlendOld)) + (aPitchHeadOldL * aUnityBlendOld)
+aPitchOldR = (aTapR * (1 - aUnityBlendOld)) + (aPitchHeadOldR * aUnityBlendOld)
+aPitchOldL = (aTapL * (1 - aPitchDepthOld)) + (aPitchOldL * aPitchDepthOld)
+aPitchOldR = (aTapR * (1 - aPitchDepthOld)) + (aPitchOldR * aPitchDepthOld)
+
+; New state
+aPhNew1 phasor aHeadRateNew
+aPhNew2 phasor aHeadRateNew, 0.5
+aOffsetNew1 = (aPhNew1 - 0.5) * aGrainNew * aSlipDirNew
+aOffsetNew2 = (aPhNew2 - 0.5) * aGrainNew * aSlipDirNew
+aReadNew1L table3 (aReadPosRaw + aOffsetNew1), giBufL, 0, 0, 1
+aReadNew1R table3 (aReadPosRaw + aOffsetNew1), giBufR, 0, 0, 1
+aReadNew2L table3 (aReadPosRaw + aOffsetNew2), giBufL, 0, 0, 1
+aReadNew2R table3 (aReadPosRaw + aOffsetNew2), giBufR, 0, 0, 1
+denorm aReadNew1L, aReadNew1R, aReadNew2L, aReadNew2R
+aWinNew1 = 0.5 - (0.5 * cos(aPhNew1 * ($M_PI * 2)))
+aWinNew2 = 0.5 - (0.5 * cos(aPhNew2 * ($M_PI * 2)))
+aPitchHeadNewL = (aReadNew1L * aWinNew1) + (aReadNew2L * aWinNew2)
+aPitchHeadNewR = (aReadNew1R * aWinNew1) + (aReadNew2R * aWinNew2)
+aPitchNewL = (aTapL * (1 - aUnityBlendNew)) + (aPitchHeadNewL * aUnityBlendNew)
+aPitchNewR = (aTapR * (1 - aUnityBlendNew)) + (aPitchHeadNewR * aUnityBlendNew)
+aPitchNewL = (aTapL * (1 - aPitchDepthNew)) + (aPitchNewL * aPitchDepthNew)
+aPitchNewR = (aTapR * (1 - aPitchDepthNew)) + (aPitchNewR * aPitchDepthNew)
+
+aPitchOutL = (aPitchOldL * aShOldGain) + (aPitchNewL * aShNewGain)
+aPitchOutR = (aPitchOldR * aShOldGain) + (aPitchNewR * aShNewGain)
+
+
+; --- 3. Feedback Injection & Write ---
+
+; Calculate Feedback
+; Loop 1 is the spiraling path, so drive it harder than the traditional echo loop
+aFB_Loop1L = tanh(aPitchOutL * aLoop1FB * aLoop1Mix * a(2.1)) * aLoop1HoldGain
+aFB_Loop1R = tanh(aPitchOutR * aLoop1FB * aLoop1Mix * a(2.1)) * aLoop1HoldGain
+denorm aFB_Loop1L, aFB_Loop1R
+
+aFB_Loop2L = tanh(aTapL * aLoop2FB * aLoop2Mix * a(1.5)) * aLoop2HoldGain
+aFB_Loop2R = tanh(aTapR * aLoop2FB * aLoop2Mix * a(1.5)) * aLoop2HoldGain
+denorm aFB_Loop2L, aFB_Loop2R
+
+; Hardware: "Feedback controls do nothing while the ECHOPHON is Frozen"
+kFBGateRaw = (kFreeze > 0.5 ? 0.0 : 1.0)
+kFBGate portk kFBGateRaw, 0.01
+aFBGateCtrl interp (kFBGate * kFbCtrl)
+aFB_Loop1L = aFB_Loop1L * aFBGateCtrl
+aFB_Loop1R = aFB_Loop1R * aFBGateCtrl
+aFB_Loop2L = aFB_Loop2L * aFBGateCtrl
+aFB_Loop2R = aFB_Loop2R * aFBGateCtrl
+
+; Keep recirculated lows and DC from stacking up across repeats
+aFB_Loop1L butterhp aFB_Loop1L, 20
+aFB_Loop1R butterhp aFB_Loop1R, 20
+aFB_Loop2L butterhp aFB_Loop2L, 20
+aFB_Loop2R butterhp aFB_Loop2R, 20
+
+; Loop 1 keeps a light analogue-style darkening; Loop 2 stays cleaner / more DD-3-like
+aFB_Loop1L tone aFB_Loop1L, kLoop1Cutoff
+aFB_Loop1R tone aFB_Loop1R, kLoop1Cutoff
+
+; Mix input and feedback
+aInL_Pre = ainL + aFB_Loop1L + aFB_Loop2L
+aInR_Pre = ainR + aFB_Loop1R + aFB_Loop2R
+denorm aInL_Pre, aInR_Pre
+
+; Hard clamp before the write path to stop runaway sums before quantization
+aInL_Pre limit aInL_Pre, -1.0, 1.0
+aInR_Pre limit aInR_Pre, -1.0, 1.0
+
+; DC Block
+aInL_Clean dcblock2 aInL_Pre
+aInR_Clean dcblock2 aInR_Pre
+
+; Write to Buffer (if not frozen)
+if kFreeze < 0.5 then
+    ; 16-bit emulation (proper rounding to avoid deadzones)
+    ; Note: 40kHz write-clock via poscil/samphold was removed — poscil at 40kHz aliases
+    ; to ~8kHz at sr=48000 (above Nyquist), producing broken staircase writes.
+    ; The 16-bit quantization below already provides the hardware character.
+    aInL_Q = round(limit(aInL_Clean, -1.0, 1.0) * a(32768)) / a(32768)
+    aInR_Q = round(limit(aInR_Clean, -1.0, 1.0) * a(32768)) / a(32768)
+    
+    tabw aInL_Q, aWriteIdx, giBufL
+    tabw aInR_Q, aWriteIdx, giBufR
+endif
+
+; --- 4. Output & Protection ---
+
+; Dry/Wet with Vactrol emulation (sluggish response)
+kMix portk gkblend, 0.15 ; 0.15s half-time mimics a slow vactrol
+aOutL ntrpol ainL, aPitchOutL, kMix
+aOutR ntrpol ainR, aPitchOutR, kMix
+
+
+; Output Protection (Hard Rule)
+; Boost output slightly to compensate for wet mix attenuation and tanh curve
+aOutL = tanh(aOutL * a(1.35)) * a(0.90)
+aOutR = tanh(aOutR * a(1.35)) * a(0.90)
+aOutL limit aOutL, -0.95, 0.95
+aOutR limit aOutR, -0.95, 0.95
+
+outs aOutL, aOutR
+
+endin

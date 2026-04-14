@@ -1,0 +1,1002 @@
+nebconfigbegin
+sr,48000
+ksmps,64
+-B,2048
+-b,512
+record,momentary,rising
+file,momentary,rising
+reset,momentary,rising
+freeze,momentary,rising
+nebconfigend
+
+/****************
+ Dvedma — PT2399-inspired lo-fi multi-tap delay
+ Witch-inspired time/filter experiment with multi-branch feedback.
+
+ Signal flow:
+   Input
+     → [tone pre-filter ~8.5kHz, BW degrades with longer delay]
+     → [delayw / 16x deltap3 taps at clustered offsets]
+     → [3 feedback branches with local filtering]
+     → [Absorb spectral split + branch mix]
+     → [tanh soft-clip + hard clip]
+     → feedback return to delay write
+     → [+ clock whistle: poscil at freq inversely tied to delay time]
+     → [dry/wet blend]
+     → Output
+
+ Control map (Nebulae panel):
+   Speed    → Delay Time       : 0=long (~4s), 1=short (~50ms); bandwidth degrades at longer times
+   Pitch    → Absorb           : CCW=dark recirculation, CW=bright loss/exposed degradation
+   Window   → Interference Amt : internal self-agitation depth
+   Size     → Filter Cutoff    : K35_lpf cutoff (200Hz–8000Hz)
+   Density  → Decay (Regen)    : feedback gain multiplier; bounded by tanh
+   Overlap  → Ghost Tails     : 0=all taps audible, 1=mid-late+tail feed loop only (not heard)
+   Blend    → Dry/Wet          : 0=dry, 1=wet
+   Start Alt → Filter Resonance : K35_lpf Q (1.0–9.8)
+   Window Alt → Input Treatment : 0=clean sum, 1=saturated/filtered sum
+
+ Hardware notes:
+   - K35_lpf: 3-arg form only (confirmed hardware)
+   - No _alt controls in nebconfig (causes boot failure on hardware)
+   - No setksmps 1 in instr 1
+   - freeverb not used (not needed)
+   - tanh/clip: confirmed via mars_affects pattern
+****************/
+
+; Wavetables
+giSine ftgen 1, 0, 4096, 10, 1
+giBruxaCheby ftgen 114, 0, 8192, 13, 1, 1, 0, 0.62, 0, 0.24, 0, 0.08
+gkInterference init 0
+
+
+instr 1
+
+; ------------------------------------------------------------
+; Control mapping
+; ------------------------------------------------------------
+
+; Delay time: speed=0 → long (~4s), speed=1 → short (~50ms)
+; Center of knob (speed=0.5) → ~1.56s
+; Curve: 0.05 + 3.975 * (1-kDelayNorm)^1.4
+kDelayNormSm   portk gkspeed, 0.20           ; hardware speed is hybrid; smooth first
+kDelayNormLat  init 0
+if (abs(kDelayNormSm - kDelayNormLat) > 0.005) then
+  kDelayNormLat = kDelayNormSm
+endif
+kDelayNorm     limit kDelayNormLat, 0, 1
+kDelayTargetBase = 0.05 + 3.975 * ((1 - kDelayNorm)^1.4)   ; ~50ms to ~4s, center ~1.56s
+
+; Speed-change detector — damps feedback and AP diffuser during delay time transitions
+; to limit pitch artifact propagation through feedback and diffusion chains.
+; Peak follower: instant attack, ~200ms exponential release.
+kDelayTargetBasePrev init 0
+kDampEnv init 0
+kSpeedDelta = abs(kDelayTargetBase - kDelayTargetBasePrev)
+kDelayTargetBasePrev = kDelayTargetBase
+iDampRel = 2^(-1 / (0.20 * (sr/ksmps)))
+kDampEnv = max(kSpeedDelta, kDampEnv * iDampRel)
+kFbDamp  portk limit(1 - kDampEnv * 120, 0.25, 1.0), 0.015
+; PT-style long-time degradation zone:
+; onset near speed=0.35 (~2.3s), strong by speed=0.15 (~3.2s), full at speed=0.
+kPTDegradePos = limit((0.35 - kDelayNorm) / 0.35, 0, 1)
+kPTDegrade    = kPTDegradePos ^ 1.7
+
+kPitchHybrid   portk gkpitch,    0.03        ; Nebulae hybrid span is -0.3..1.3 with center at 0.6
+kPitchClamped  limit kPitchHybrid, -0.3, 1.3
+if (kPitchClamped <= 0.6) then
+  kAbsorbRaw = ((kPitchClamped + 0.3) / 0.9) * 0.5
+else
+  kAbsorbRaw = 0.5 + (((kPitchClamped - 0.6) / 0.7) * 0.5)
+endif
+kAbsorb           = limit(kAbsorbRaw, 0, 1)  ; 0.6 on hardware maps to neutral absorb
+; Absorb color drift — slow autonomous color evolution (~20s period)
+kAbsorbDriftRaw  randomh -1.0, 1.0, 0.05
+kAbsorbDrift     portk kAbsorbDriftRaw, 5.0
+kAbsorb          = limit(kAbsorb + (kAbsorbDrift * 0.12), 0, 1)
+kFailureFlavor    portk gkloopstart, 0.03    ; start is bipolar failure flavor macro
+kInterferenceCtrl portk gkwindow,   0.03     ; internal self-agitation depth
+kCutoffCtrl       portk gkloopsize, 0.03     ; filter cutoff (normalized)                    
+kResonanceCtrl    chnget "start_alt"         ; start_alt -> Filter Q
+kInTreatmentCtrl  chnget "window_alt"        ; window_alt -> Input Treatment (0=clean, 1=dirty)
+kDecay            portk gkdensity,  0.03     ; feedback gain
+kBlend            portk gkblend,    0.03     ; dry/wet
+kGhostTailsRaw    portk gkoverlap,  0.03     ; ghost tails depth
+kGhostTails       portk limit(kGhostTailsRaw, 0, 1), 0.08
+
+; Scale to useful ranges
+kCutoffHz      = 200 + kCutoffCtrl * 7800    ; 200Hz to 8000Hz
+kQ             = 1.0 + kResonanceCtrl * 8.8  ; 1.0 to 9.8
+
+; Feedback gain: 0 to 1.1 — allows self-oscillation above density ~0.91
+; tanh soft-clips the feedback so runaway stays musical, not destructive
+kDecayGain     = kDecay * 1.1               ; density=1.0 → gain=1.1 → self-oscillation
+
+; Failure flavor/depth:
+; - window still scales current interference positively
+; - the new malfunction layer is inversely mapped to window
+; - start biases the malfunction family between drops/crinkles and snags/pops
+kFailureDepth        = 1 - kInterferenceCtrl
+kFailureFlavorBi     = (kFailureFlavor * 2) - 1
+kDropCrinkleBlend    = limit(0.5 - (0.5 * kFailureFlavorBi), 0, 1)
+kSnagPopBlend        = limit(0.5 + (0.5 * kFailureFlavorBi), 0, 1)
+kDropCrinkleDepth    = kFailureDepth * kDropCrinkleBlend
+kSnagPopDepth        = kFailureDepth * kSnagPopBlend
+
+; Malfunction engine — Poisson event generators
+; Rates are mean events/second (λ), scale with delay time
+kTimeScale     = 0.3 + kDelayNorm * 0.7
+kDropRateHz    = (0.20 + (kDropCrinkleDepth * 2.80)) * kTimeScale
+kCrinkleRateHz = (0.40 + (kDropCrinkleDepth * 6.60)) * kTimeScale
+kSnagRateHz    = (0.20 + (kSnagPopDepth    * 2.40)) * kTimeScale
+kPopRateHz     = (0.35 + (kSnagPopDepth    * 8.65)) * kTimeScale
+
+kDropMaxDuck         = 0.94
+kDropBedDepth        = 0.04 + (0.18 * kDropCrinkleDepth)
+kDropBedRateHz       = (0.08 + (0.42 * kDropCrinkleDepth)) * kTimeScale
+kHeadLossBedDepth    = 0.03 + (0.16 * kDropCrinkleDepth)
+kCrinkleHighpassHz   = limit(kCutoffHz * 0.28, 200, 3500)
+kCrinkleLowpassHz    = limit(kCutoffHz * 0.92, 400, 8500)
+kCrinkleLevel        = 0.025 + (0.075 * kDropCrinkleDepth)
+kHeadLossDepth       = 0.08  + (0.34  * kDropCrinkleDepth)
+kSnagHFLossDepth     = 0.12  + (0.50  * kSnagPopDepth)
+kSnagDuckDepth       = 0.06  + (0.22  * kSnagPopDepth)
+kHeadLossHighpassHz  = 140
+kHeadLossLowpassHz   = 4200
+kPopLevel            = 0.010 + (0.050 * kSnagPopDepth)
+kPopHighpassHz       = 1800
+kPopLowpassHz        = 7200
+kFailureToLoopGain   = 0.10
+; Chewed tape: snag drifts delay time UP (tape slows = pitch drops)
+; Rise and recovery drawn per-event alongside magnitude/duration
+kSnagDriftDepth = 0.010 + (0.025 * kSnagPopDepth)
+
+; ============================================================
+; Poisson event generators — no scan clock, no threshold crossing
+; Random values drawn unconditionally each k-cycle; captured at trigger.
+; Between events: amplitude is exactly 0.
+; ============================================================
+
+; Interval seeds (uniform → exponential via -log(U)/λ)
+kDrpU_L  random 0.001, 0.999
+kDrpU_R  random 0.001, 0.999
+kCrkU_L  random 0.001, 0.999
+kCrkU_R  random 0.001, 0.999
+kSngU_L  random 0.001, 0.999
+kSngU_R  random 0.001, 0.999
+kPopU_L  random 0.001, 0.999
+kPopU_R  random 0.001, 0.999
+; Magnitude seeds (0–1, scaled at output by depth params)
+kDrpMag_L random 0, 1
+kDrpMag_R random 0, 1
+kCrkMag_L random 0, 1
+kCrkMag_R random 0, 1
+kSngMag_L random 0, 1
+kSngMag_R random 0, 1
+kPopMag_L random 0, 1
+kPopMag_R random 0, 1
+; Duration seeds (seconds)
+kDrpDur_L random 0.050, 0.350
+kDrpDur_R random 0.050, 0.350
+kCrkDur_L random 0.015, 0.120
+kCrkDur_R random 0.015, 0.120
+kSngDur_L    random 0.100, 0.550
+kSngDur_R    random 0.100, 0.550
+kSngRise_L   random 0.030, 0.180   ; drift catch speed
+kSngRise_R   random 0.030, 0.180
+kSngRec_L    random 0.120, 0.600   ; drift release speed
+kSngRec_R    random 0.120, 0.600
+; Head jag — brief bidirectional offset, drawn independently per event
+kSngJagMag_L random 0, 1           ; jag magnitude seed (scaled to ±2ms by depth)
+kSngJagMag_R random 0, 1
+kSngJagSgn_L   random 0, 1           ; jag direction seed
+kSngJagSgn_R   random 0, 1
+kSngDriftSgn_L random 0, 1           ; drift direction seed (coin toss per event)
+kSngDriftSgn_R random 0, 1
+kSngJagDur_L random 0.015, 0.080   ; jag duration: 15–80ms (short, transient)
+kSngJagDur_R random 0.015, 0.080
+kPopDur_L random 0.008, 0.055
+kPopDur_R random 0.008, 0.055
+
+; State
+kDrpTimer_L init 0  ;  — drop L
+kDrpAmp_L   init 0
+kDrpDec_L   init 1
+kDrpTimer_R init 0  ;  — drop R
+kDrpAmp_R   init 0
+kDrpDec_R   init 1
+kCrkTimer_L init 0  ;  — crinkle L
+kCrkAmp_L   init 0
+kCrkDec_L   init 1
+kCrkTimer_R init 0  ;  — crinkle R
+kCrkAmp_R   init 0
+kCrkDec_R   init 1
+kSngTimer_L  init 0  ;  — snag L
+kSngAmp_L    init 0
+kSngDec_L    init 1
+kSngRiseH_L  init 0.080
+kSngRecH_L   init 0.300
+kSngJagAmp_L init 0
+kSngJagDec_L init 1
+kSngTimer_R  init 0  ;  — snag R
+kSngAmp_R    init 0
+kSngDec_R    init 1
+kSngRiseH_R  init 0.080
+kSngRecH_R   init 0.300
+kSngJagAmp_R init 0
+kSngJagDec_R init 1
+kPopTimer_L init 0  ;  — pop L
+kPopAmp_L   init 0
+kPopDec_L   init 1
+kPopTimer_R init 0  ;  — pop R
+kPopAmp_R   init 0
+kPopDec_R   init 1
+
+; Drop L
+kDrpTimer_L = kDrpTimer_L - (1/kr)
+if kDrpTimer_L <= 0 && kDropRateHz > 0 then
+  kDrpTimer_L = (-log(kDrpU_L)) / kDropRateHz
+  kDrpAmp_L   = kDrpMag_L
+  kDrpDec_L   = 0.001 ^ (1 / max(kDrpDur_L * kr, 1))
+endif
+kDrpAmp_L = kDrpAmp_L * kDrpDec_L
+if kDrpAmp_L < 0.001 then
+  kDrpAmp_L = 0
+  kDrpDec_L = 1
+endif
+; Drop R
+kDrpTimer_R = kDrpTimer_R - (1/kr)
+if kDrpTimer_R <= 0 && kDropRateHz > 0 then
+  kDrpTimer_R = (-log(kDrpU_R)) / kDropRateHz
+  kDrpAmp_R   = kDrpMag_R
+  kDrpDec_R   = 0.001 ^ (1 / max(kDrpDur_R * kr, 1))
+endif
+kDrpAmp_R = kDrpAmp_R * kDrpDec_R
+if kDrpAmp_R < 0.001 then
+  kDrpAmp_R = 0
+  kDrpDec_R = 1
+endif
+; Crinkle L
+kCrkTimer_L = kCrkTimer_L - (1/kr)
+if kCrkTimer_L <= 0 && kCrinkleRateHz > 0 then
+  kCrkTimer_L = (-log(kCrkU_L)) / kCrinkleRateHz
+  kCrkAmp_L   = kCrkMag_L
+  kCrkDec_L   = 0.001 ^ (1 / max(kCrkDur_L * kr, 1))
+endif
+kCrkAmp_L = kCrkAmp_L * kCrkDec_L
+if kCrkAmp_L < 0.001 then
+  kCrkAmp_L = 0
+  kCrkDec_L = 1
+endif
+; Crinkle R
+kCrkTimer_R = kCrkTimer_R - (1/kr)
+if kCrkTimer_R <= 0 && kCrinkleRateHz > 0 then
+  kCrkTimer_R = (-log(kCrkU_R)) / kCrinkleRateHz
+  kCrkAmp_R   = kCrkMag_R
+  kCrkDec_R   = 0.001 ^ (1 / max(kCrkDur_R * kr, 1))
+endif
+kCrkAmp_R = kCrkAmp_R * kCrkDec_R
+if kCrkAmp_R < 0.001 then
+  kCrkAmp_R = 0
+  kCrkDec_R = 1
+endif
+; Snag L
+kSngDriftSign_L init 1
+kSngTimer_L = kSngTimer_L - (1/kr)
+if kSngTimer_L <= 0 && kSnagRateHz > 0 then
+  kSngTimer_L     = (-log(kSngU_L)) / kSnagRateHz
+  kSngAmp_L       = kSngMag_L
+  kSngDec_L       = 0.001 ^ (1 / max(kSngDur_L * kr, 1))
+  kSngRiseH_L     = kSngRise_L
+  kSngRecH_L      = kSngRec_L
+  kSngDriftSign_L = (kSngDriftSgn_L > 0.5 ? 1 : -1)
+  ; Head jag — brief transient, decays independently and faster than drift
+  kSngJagAmp_L = kSngJagMag_L * kSnagPopDepth * 0.002 * (kSngJagSgn_L > 0.5 ? 1 : -1)
+  kSngJagDec_L = 0.001 ^ (1 / max(kSngJagDur_L * kr, 1))
+endif
+kSngAmp_L    = kSngAmp_L * kSngDec_L
+kSngJagAmp_L = kSngJagAmp_L * kSngJagDec_L
+if kSngAmp_L < 0.001 then
+  kSngAmp_L = 0
+  kSngDec_L = 1
+endif
+if abs(kSngJagAmp_L) < 0.0001 then
+  kSngJagAmp_L = 0
+  kSngJagDec_L = 1
+endif
+kSnagJagL portk kSngJagAmp_L, 0.010
+; Snag R
+kSngDriftSign_R init 1
+kSngTimer_R = kSngTimer_R - (1/kr)
+if kSngTimer_R <= 0 && kSnagRateHz > 0 then
+  kSngTimer_R     = (-log(kSngU_R)) / kSnagRateHz
+  kSngAmp_R       = kSngMag_R
+  kSngDec_R       = 0.001 ^ (1 / max(kSngDur_R * kr, 1))
+  kSngRiseH_R     = kSngRise_R
+  kSngRecH_R      = kSngRec_R
+  kSngDriftSign_R = (kSngDriftSgn_R > 0.5 ? 1 : -1)
+  kSngJagAmp_R = kSngJagMag_R * kSnagPopDepth * 0.002 * (kSngJagSgn_R > 0.5 ? 1 : -1)
+  kSngJagDec_R = 0.001 ^ (1 / max(kSngJagDur_R * kr, 1))
+endif
+kSngAmp_R    = kSngAmp_R * kSngDec_R
+kSngJagAmp_R = kSngJagAmp_R * kSngJagDec_R
+if kSngAmp_R < 0.001 then
+  kSngAmp_R = 0
+  kSngDec_R = 1
+endif
+if abs(kSngJagAmp_R) < 0.0001 then
+  kSngJagAmp_R = 0
+  kSngJagDec_R = 1
+endif
+kSnagJagR portk kSngJagAmp_R, 0.010
+; Pop L
+kPopTimer_L = kPopTimer_L - (1/kr)
+if kPopTimer_L <= 0 && kPopRateHz > 0 then
+  kPopTimer_L = (-log(kPopU_L)) / kPopRateHz
+  kPopAmp_L   = kPopMag_L
+  kPopDec_L   = 0.001 ^ (1 / max(kPopDur_L * kr, 1))
+endif
+kPopAmp_L = kPopAmp_L * kPopDec_L
+if kPopAmp_L < 0.001 then
+  kPopAmp_L = 0
+  kPopDec_L = 1
+endif
+; Pop R
+kPopTimer_R = kPopTimer_R - (1/kr)
+if kPopTimer_R <= 0 && kPopRateHz > 0 then
+  kPopTimer_R = (-log(kPopU_R)) / kPopRateHz
+  kPopAmp_R   = kPopMag_R
+  kPopDec_R   = 0.001 ^ (1 / max(kPopDur_R * kr, 1))
+endif
+kPopAmp_R = kPopAmp_R * kPopDec_R
+if kPopAmp_R < 0.001 then
+  kPopAmp_R = 0
+  kPopDec_R = 1
+endif
+
+; Aliases used by the rest of the instrument
+kDropEnvL    = kDrpAmp_L
+kDropEnvR    = kDrpAmp_R
+kCrinkleEnvL = kCrkAmp_L
+kCrinkleEnvR = kCrkAmp_R
+kSnagEnvL    = kSngAmp_L
+kSnagEnvR    = kSngAmp_R
+kPopEnvL     = kPopAmp_L
+kPopEnvR     = kPopAmp_R
+
+; Drop bed — shared slow random background (ported from bruxa-12)
+; Simultaneously adds low-level background to amplitude dip and head loss
+kDropBedScan randomh 0.0, 1.0, kDropBedRateHz
+kDropBed     portk kDropBedScan, 0.40
+
+kWetDropGainL = 1 - ((kDropBed * kDropBedDepth) + ((kDropEnvL^1.3) * kDropCrinkleDepth * kDropMaxDuck))
+kWetDropGainR = 1 - ((kDropBed * kDropBedDepth) + ((kDropEnvR^1.3) * kDropCrinkleDepth * kDropMaxDuck))
+
+; Snag drift — delay time increases (tape slows = pitch drops), fast catch, slow release
+kSnagDriftTargetL = kSnagEnvL * kSnagDriftDepth * kDelayTargetBase * kSngDriftSign_L
+kSnagDriftTargetR = kSnagEnvR * kSnagDriftDepth * kDelayTargetBase * kSngDriftSign_R
+kSnagDriftL portk kSnagDriftTargetL, (abs(kSnagDriftTargetL) > abs(kSnagDriftL) ? kSngRiseH_L : kSngRecH_L)
+kSnagDriftR portk kSnagDriftTargetR, (abs(kSnagDriftTargetR) > abs(kSnagDriftR) ? kSngRiseH_R : kSngRecH_R)
+
+; ------------------------------------------------------------
+; Button hold states (momentary)
+; B1=record, B2=file, B3=reset, B4=freeze
+; Solo behaviors run when ONLY that button is held.
+; Combos require B1 (record) held with one other.
+; ------------------------------------------------------------
+
+kB1 = (gkrecord > 0.5 ? 1 : 0)
+kB2 = (gkfilesel > 0.5 ? 1 : 0)
+kB3 = (gkreset > 0.5 ? 1 : 0)
+kB4 = (gkfreeze > 0.5 ? 1 : 0)
+
+; Solo flags (only that button held)
+kSoloB1 = (kB1 == 1 && kB2 == 0 && kB3 == 0 && kB4 == 0 ? 1 : 0)
+kSoloB2 = (kB2 == 1 && kB1 == 0 && kB3 == 0 && kB4 == 0 ? 1 : 0)
+kSoloB3 = (kB3 == 1 && kB1 == 0 && kB2 == 0 && kB4 == 0 ? 1 : 0)
+kSoloB4 = (kB4 == 1 && kB1 == 0 && kB2 == 0 && kB3 == 0 ? 1 : 0)
+
+; ------------------------------------------------------------
+; Hold accumulators — ramp up while button held, decay on release.
+; Longer hold = stronger effect; release decays from held level.
+; Combos: B1 + any other button held simultaneously.
+; ------------------------------------------------------------
+
+; Combo gate flags
+kGateB1B2 = (kB1 == 1 && kB2 == 1 ? 1 : 0)
+kGateB1B3 = (kB1 == 1 && kB3 == 1 ? 1 : 0)
+kGateB1B4 = (kB1 == 1 && kB4 == 1 ? 1 : 0)
+
+; decay constants — per-k multipliers (half-life in seconds)
+; half_life = -ln(2) / ln(decay_per_k), or decay = 2^(-1/(half_life * kr))
+; kr = sr/ksmps = 48000/64 = 750 Hz
+iKr = sr / ksmps
+iDecaySlow   = 2^(-1 / (8.0  * iKr))   ; ~8s half-life
+iDecayMed    = 2^(-1 / (4.0  * iKr))   ; ~4s half-life
+iDecayFast   = 2^(-1 / (2.0  * iKr))   ; ~2s half-life
+
+; rise rates — per-k increment; time to reach full effect from 0
+iRiseB1   = 1 / (4.0 * iKr)   ; 4s — slow bloom
+iRiseB2   = 1 / (1.5 * iKr)   ; 1.5s — deliberate cut
+iRiseB3   = 1 / (2.0 * iKr)   ; 2s
+iRiseB4   = 1 / (2.0 * iKr)   ; 2s base — scaled by delay time below
+iRiseB1B2 = 1 / (3.0 * iKr)   ; 3s
+iRiseB1B3 = 1 / (3.0 * iKr)   ; 3s
+iRiseB1B4 = 1 / (1.5 * iKr)   ; 1.5s
+
+kAccumB1   init 0
+kAccumB2   init 0
+kAccumB3   init 0
+kAccumB4   init 0
+kAccumB1B2 init 0
+kAccumB1B3 init 0
+kAccumB1B4 init 0
+
+if kSoloB1 > 0.5 then
+  kAccumB1 = limit(kAccumB1 + iRiseB1, 0, 1)
+else
+  kAccumB1 = kAccumB1 * iDecaySlow
+endif
+if kSoloB2 > 0.5 then
+  kAccumB2 = limit(kAccumB2 + iRiseB2, 0, 1)
+else
+  kAccumB2 = kAccumB2 * iDecayMed
+endif
+if kSoloB3 > 0.5 then
+  kAccumB3 = limit(kAccumB3 + iRiseB3, 0, 1)
+else
+  kAccumB3 = kAccumB3 * iDecayMed
+endif
+; B4 rise rate scales inversely with delay time — short delay is more pitch-sensitive
+kRiseB4 = iRiseB4 * (0.35 + (1 - kDelayNorm) * 0.65)
+if kSoloB4 > 0.5 then
+  kAccumB4 = limit(kAccumB4 + kRiseB4, 0, 1)
+else
+  kAccumB4 = kAccumB4 * iDecayMed
+endif
+if kGateB1B2 > 0.5 then
+  kAccumB1B2 = limit(kAccumB1B2 + iRiseB1B2, 0, 1)
+else
+  kAccumB1B2 = kAccumB1B2 * iDecaySlow
+endif
+if kGateB1B3 > 0.5 then
+  kAccumB1B3 = limit(kAccumB1B3 + iRiseB1B3, 0, 1)
+else
+  kAccumB1B3 = kAccumB1B3 * iDecayMed
+endif
+if kGateB1B4 > 0.5 then
+  kAccumB1B4 = limit(kAccumB1B4 + iRiseB1B4, 0, 1)
+else
+  kAccumB1B4 = kAccumB1B4 * iDecayFast
+endif
+
+; B1 solo — bloom: accumulates decay gain boost, decays over ~8s
+kDecayGain = kDecayGain + (kAccumB1 * 0.18)
+
+; ------------------------------------------------------------
+; PT2399 bandwidth model
+; Longer delay = lower effective sample rate = more bandwidth loss
+; Input pre-filter: ~8.5kHz at short times, degrades toward ~3kHz at long times
+; Output post-filter: ~5.8kHz at short times, degrades toward ~2kHz at long times
+; ------------------------------------------------------------
+
+kDelayNormSmooth portk kDelayNorm, 0.1
+kPreBW     = 8500 - (kPTDegrade * 5500)   ; 8500Hz → 3000Hz in the long-time zone
+kPostBW    = 5800 - (kPTDegrade * 3800)   ; 5800Hz → 2000Hz in the long-time zone
+
+; Clock whistle frequency: inversely tied to delay time (like PT2399 VCO leakage)
+; Short delay = fast clock = high pitch whistle; long delay = slow clock = low pitch
+kWhistleFreq = 200 + (kDelayNormSmooth^1.5) * 2800   ; ~200Hz to ~3000Hz
+kWhistleAmp  = 0.00035 + (kPTDegrade * 0.00110)
+
+; Thermal time drift — independent slow random walk per channel
+; Slightly different rates (~0.070 vs ~0.083 Hz) create ~77s stereo beating
+kThermalRawL  randomh -1.0, 1.0, 0.070
+kThermalRawR  randomh -1.0, 1.0, 0.083
+kThermalHalfL rspline 1.5, 5.0, 0.02, 0.07
+kThermalHalfR rspline 1.5, 5.0, 0.02, 0.07
+kThermalL     portk kThermalRawL, kThermalHalfL
+kThermalR     portk kThermalRawR, kThermalHalfR
+; ±3% multiplicative offset — ~±50 cents peak pitch drift, smooth over seconds
+kThermalOffsetL = kThermalL * 0.03
+kThermalOffsetR = kThermalR * 0.03
+
+; ------------------------------------------------------------
+; Input
+; ------------------------------------------------------------
+
+#ifdef RUNNER_INPUT_FILE
+  iFileChn filenchnls $RUNNER_INPUT_FILE
+  if iFileChn > 1 then
+      aSrcL, aSrcR diskin2 $RUNNER_INPUT_FILE, 1, 0, 1
+  else
+      aSrcL diskin2 $RUNNER_INPUT_FILE, 1, 0, 1
+      aSrcR = aSrcL
+  endif
+#else
+  aSrcL inch 1
+  aSrcR inch 2
+#endif
+
+; Input level trim
+aSrcL = aSrcL * 0.85
+aSrcR = aSrcR * 0.85
+
+; B2 solo — input cut: each press deposits silence that decays over ~4s
+kInputGate portk (1 - kAccumB2), 0.015
+kInputGate = limit(kInputGate, 0, 1)
+aSrcL = aSrcL * kInputGate
+aSrcR = aSrcR * kInputGate
+
+; ------------------------------------------------------------
+; Feedback state (global so delay read can feed back to write)
+; ------------------------------------------------------------
+
+; Initialize feedback signals
+aFeedbackL init 0
+aFeedbackR init 0
+
+; ------------------------------------------------------------
+; Pre-filter: simulate PT2399 input MFB filter bandwidth limit
+; Bandwidth degrades at longer delay times
+; ------------------------------------------------------------
+
+; B3 solo — cross-entangle: coupling accumulates and decays over ~4s
+kEntangle   portk kAccumB3 * 0.28, 0.05
+aMixL       = aSrcL + aFeedbackL + (aFeedbackR * kEntangle)
+aMixR       = aSrcR + aFeedbackR + (aFeedbackL * kEntangle)
+aInputSatL  tanh aMixL
+aInputSatR  tanh aMixR
+aPreL       tone aInputSatL, kPreBW
+aPreR       tone aInputSatR, kPreBW
+
+; Input Treatment blend: CCW (0) = Clean sum, CW (1) = Saturated/Filtered sum
+kInTreatment portk limit(kInTreatmentCtrl, 0, 1), 0.03
+kInXFadeA = cos(kInTreatment * 1.57079632) ; CCW: 1.0
+kInXFadeB = sin(kInTreatment * 1.57079632) ; CW: 1.0
+aFinalInL = (aMixL * kInXFadeA) + (aPreL * kInXFadeB)
+aFinalInR = (aMixR * kInXFadeA) + (aPreR * kInXFadeB)
+
+; ------------------------------------------------------------
+; Delay buffer: 16 taps split into early / mid / late families
+; All reads from a single delayr buffer (cheap — 16 reads, 1 write)
+; Family ratios are intentionally irregular and L/R decorrelated so the tail
+; reads as a cloud rather than a fixed rhythmic lattice.
+; ------------------------------------------------------------
+
+iMaxDelay = 10.0   ; seconds, covers 16-tap spread at maximum delay time (~4s * 1.91 + headroom)
+
+; Interference-driven self-agitation stays bounded to avoid zippering/runaway
+kInterferenceMod portk gkInterference, 2.5
+kTimeAgitate   = limit(kInterferenceMod * kInterferenceCtrl * 0.018, 0, 0.018)
+; B4 solo — interference pitch: accumulates delay droop, glides to new pitch over ~2s
+kInterfPitchRaw    = kAccumB4 * kInterferenceMod * 0.35
+kInterfPitchOffset portk kInterfPitchRaw, 0.7
+; B1+B4 — drop pitch: accumulates pitch deflection from dropout events, ~2s decay
+kDropPitchL = kAccumB1B4 * kDropEnvL * 0.12
+kDropPitchR = kAccumB1B4 * kDropEnvR * 0.12
+; Snag drift: slow pitch-down (tape losing traction); jag: brief bidirectional head slip
+kDelayTimeL    = limit((kDelayTargetBase * (1 + kThermalOffsetL)) + kSnagDriftL + kSnagJagL + kTimeAgitate + kInterfPitchOffset + kDropPitchL, 0.05, 5.00)
+kDelayTimeR    = limit((kDelayTargetBase * (1 + kThermalOffsetR)) + kSnagDriftR + kSnagJagR + kTimeAgitate + kInterfPitchOffset + kDropPitchR, 0.05, 5.00)
+kDelayTimeL_s  portk kDelayTimeL, 0.004
+kDelayTimeR_s  portk kDelayTimeR, 0.004
+aDelayTimeL    = a(kDelayTimeL_s)
+aDelayTimeR    = a(kDelayTimeR_s)
+kDelayCycleSec = max((kDelayTimeL_s + kDelayTimeR_s) * 0.5, 0.03)
+kCyclePhs      phasor (1 / kDelayCycleSec)
+kPrevCyclePhs  init 0
+if (kCyclePhs < kPrevCyclePhs) then
+  gkeol = 20
+else
+  if (gkeol > 0) then
+    gkeol = gkeol - 1
+  endif
+endif
+kPrevCyclePhs = kCyclePhs
+kCutoffAgitate = limit(kInterferenceMod * kInterferenceCtrl * 1800, 0, 1800)
+kCutoffMain    = limit(kCutoffHz + kCutoffAgitate, 120, 9500)
+; Cutoff span driven by Size: narrow spread at low cutoff, wide at high cutoff
+; At Size=0: dark=0.72×main, bright=1.15×main (compressed)
+; At Size=0.5: dark≈0.49×, bright≈1.55× (near original)
+; At Size=1: dark=0.26×main, bright=1.95×main (stretched)
+kDarkRatio    = 0.72 - (0.46 * kCutoffCtrl)
+kBrightRatio  = 1.15 + (0.80 * kCutoffCtrl)
+kCutoffDark   = limit(kCutoffMain * kDarkRatio,  80, 5000)
+kCutoffBright = limit(kCutoffMain * kBrightRatio, 300, 11000)
+kQMain         = kQ
+kQDark         = 0.45 + kQ * 0.55
+kQBright       = 0.35 + kQ * 0.35
+
+; Slow-time blur: as speed goes slow, compress tap spacing around the base delay
+; so the tail reads as accumulation rather than a fixed melodic phrase.
+kSlowBlur  = kPTDegrade
+kTapSpread = 1 - (0.78 * kSlowBlur)
+
+; Tap ratios compressed: max L=1.50, max R=1.55 (was 2.21/2.27)
+; Gaps at 1s delay now 50–130ms vs 60–190ms, reducing rhythmic lattice
+kTap1LRatio  = 1 + ((0.07 - 1) * kTapSpread)
+kTap2LRatio  = 1 + ((0.12 - 1) * kTapSpread)
+kTap3LRatio  = 1 + ((0.18 - 1) * kTapSpread)
+kTap4LRatio  = 1 + ((0.26 - 1) * kTapSpread)
+kTap5LRatio  = 1 + ((0.33 - 1) * kTapSpread)
+kTap6LRatio  = 1 + ((0.43 - 1) * kTapSpread)
+kTap7LRatio  = 1 + ((0.52 - 1) * kTapSpread)
+kTap8LRatio  = 1 + ((0.60 - 1) * kTapSpread)
+kTap9LRatio  = 1 + ((0.71 - 1) * kTapSpread)
+kTap10LRatio = 1 + ((0.81 - 1) * kTapSpread)
+kTap11LRatio = 1 + ((0.90 - 1) * kTapSpread)
+kTap12LRatio = 1 + ((1.03 - 1) * kTapSpread)
+kTap13LRatio = 1 + ((1.14 - 1) * kTapSpread)
+kTap14LRatio = 1 + ((1.25 - 1) * kTapSpread)
+kTap15LRatio = 1 + ((1.38 - 1) * kTapSpread)
+kTap16LRatio = 1 + ((1.50 - 1) * kTapSpread)
+
+kTap1RRatio  = 1 + ((0.09 - 1) * kTapSpread)
+kTap2RRatio  = 1 + ((0.14 - 1) * kTapSpread)
+kTap3RRatio  = 1 + ((0.21 - 1) * kTapSpread)
+kTap4RRatio  = 1 + ((0.29 - 1) * kTapSpread)
+kTap5RRatio  = 1 + ((0.39 - 1) * kTapSpread)
+kTap6RRatio  = 1 + ((0.47 - 1) * kTapSpread)
+kTap7RRatio  = 1 + ((0.55 - 1) * kTapSpread)
+kTap8RRatio  = 1 + ((0.66 - 1) * kTapSpread)
+kTap9RRatio  = 1 + ((0.74 - 1) * kTapSpread)
+kTap10RRatio = 1 + ((0.85 - 1) * kTapSpread)
+kTap11RRatio = 1 + ((0.95 - 1) * kTapSpread)
+kTap12RRatio = 1 + ((1.07 - 1) * kTapSpread)
+kTap13RRatio = 1 + ((1.20 - 1) * kTapSpread)
+kTap14RRatio = 1 + ((1.31 - 1) * kTapSpread)
+kTap15RRatio = 1 + ((1.44 - 1) * kTapSpread)
+kTap16RRatio = 1 + ((1.55 - 1) * kTapSpread)
+
+; Left channel — 16 taps, irregular early / mid / late families
+aBufL        delayr iMaxDelay
+aTap1L       deltap3 aDelayTimeL * kTap1LRatio
+aTap2L       deltap3 aDelayTimeL * kTap2LRatio
+aTap3L       deltap3 aDelayTimeL * kTap3LRatio
+aTap4L       deltap3 aDelayTimeL * kTap4LRatio
+aTap5L       deltap3 aDelayTimeL * kTap5LRatio
+aTap6L       deltap3 aDelayTimeL * kTap6LRatio
+aTap7L       deltap3 aDelayTimeL * kTap7LRatio
+aTap8L       deltap3 aDelayTimeL * kTap8LRatio
+aTap9L       deltap3 aDelayTimeL * kTap9LRatio
+aTap10L      deltap3 aDelayTimeL * kTap10LRatio
+aTap11L      deltap3 aDelayTimeL * kTap11LRatio
+aTap12L      deltap3 aDelayTimeL * kTap12LRatio
+aTap13L      deltap3 aDelayTimeL * kTap13LRatio
+aTap14L      deltap3 aDelayTimeL * kTap14LRatio
+aTap15L      deltap3 aDelayTimeL * kTap15LRatio
+aTap16L      deltap3 aDelayTimeL * kTap16LRatio
+             delayw aFinalInL
+
+; Right channel keeps the same family structure but with different offsets.
+aBufR        delayr iMaxDelay
+aTap1R       deltap3 aDelayTimeR * kTap1RRatio
+aTap2R       deltap3 aDelayTimeR * kTap2RRatio
+aTap3R       deltap3 aDelayTimeR * kTap3RRatio
+aTap4R       deltap3 aDelayTimeR * kTap4RRatio
+aTap5R       deltap3 aDelayTimeR * kTap5RRatio
+aTap6R       deltap3 aDelayTimeR * kTap6RRatio
+aTap7R       deltap3 aDelayTimeR * kTap7RRatio
+aTap8R       deltap3 aDelayTimeR * kTap8RRatio
+aTap9R       deltap3 aDelayTimeR * kTap9RRatio
+aTap10R      deltap3 aDelayTimeR * kTap10RRatio
+aTap11R      deltap3 aDelayTimeR * kTap11RRatio
+aTap12R      deltap3 aDelayTimeR * kTap12RRatio
+aTap13R      deltap3 aDelayTimeR * kTap13RRatio
+aTap14R      deltap3 aDelayTimeR * kTap14RRatio
+aTap15R      deltap3 aDelayTimeR * kTap15RRatio
+aTap16R      deltap3 aDelayTimeR * kTap16RRatio
+             delayw aFinalInR
+
+; Tap weight evolution — cloud shifts from diffuse to depth-weighted as feedback builds.
+; Absorb also tilts family balance: low absorb favors early/dark recirculation,
+; high absorb favors later/airier residue without changing delay-time topology.
+; kDepthDrive responds slowly (2s portk) to avoid zipper.
+kDepthDriveRaw limit gkInterference / 0.25, 0, 1
+kDepthDrive    portk kDepthDriveRaw, 2.0
+
+kW1  = 0.055 + (0.010 - 0.055) * kDepthDrive
+kW2  = 0.060 + (0.010 - 0.060) * kDepthDrive
+kW3  = 0.065 + (0.015 - 0.065) * kDepthDrive
+kW4  = 0.065 + (0.015 - 0.065) * kDepthDrive
+kW5  = 0.065 + (0.020 - 0.065) * kDepthDrive
+kW6  = 0.065 + (0.020 - 0.065) * kDepthDrive
+kW7  = 0.065 + (0.025 - 0.065) * kDepthDrive
+kW8  = 0.065 + (0.030 - 0.065) * kDepthDrive
+kW9  = 0.065 + (0.090 - 0.065) * kDepthDrive
+kW10 = 0.060 + (0.100 - 0.060) * kDepthDrive
+kW11 = 0.060 + (0.110 - 0.060) * kDepthDrive
+kW12 = 0.060 + (0.115 - 0.060) * kDepthDrive
+kW13 = 0.055 + (0.120 - 0.055) * kDepthDrive
+kW14 = 0.055 + (0.125 - 0.055) * kDepthDrive
+kW15 = 0.050 + (0.120 - 0.050) * kDepthDrive
+kW16 = 0.050 + (0.075 - 0.050) * kDepthDrive
+
+kFlatW = 1.0 / 16.0
+kW1  = kW1  + ((kFlatW - kW1)  * kSlowBlur * 0.72)
+kW2  = kW2  + ((kFlatW - kW2)  * kSlowBlur * 0.72)
+kW3  = kW3  + ((kFlatW - kW3)  * kSlowBlur * 0.72)
+kW4  = kW4  + ((kFlatW - kW4)  * kSlowBlur * 0.72)
+kW5  = kW5  + ((kFlatW - kW5)  * kSlowBlur * 0.72)
+kW6  = kW6  + ((kFlatW - kW6)  * kSlowBlur * 0.72)
+kW7  = kW7  + ((kFlatW - kW7)  * kSlowBlur * 0.72)
+kW8  = kW8  + ((kFlatW - kW8)  * kSlowBlur * 0.72)
+kW9  = kW9  + ((kFlatW - kW9)  * kSlowBlur * 0.72)
+kW10 = kW10 + ((kFlatW - kW10) * kSlowBlur * 0.72)
+kW11 = kW11 + ((kFlatW - kW11) * kSlowBlur * 0.72)
+kW12 = kW12 + ((kFlatW - kW12) * kSlowBlur * 0.72)
+kW13 = kW13 + ((kFlatW - kW13) * kSlowBlur * 0.72)
+kW14 = kW14 + ((kFlatW - kW14) * kSlowBlur * 0.72)
+kW15 = kW15 + ((kFlatW - kW15) * kSlowBlur * 0.72)
+kW16 = kW16 + ((kFlatW - kW16) * kSlowBlur * 0.72)
+
+kEarlyFam = 1.18 - (0.46 * kAbsorb)
+kMidFam   = 0.96 + (0.08 * (1 - abs((kAbsorb * 2) - 1)))
+kLateFam  = 0.82 + (0.52 * kAbsorb)
+
+kEarlyFam = kEarlyFam + ((1 - kEarlyFam) * kSlowBlur * 0.65)
+kMidFam   = kMidFam   + ((1 - kMidFam)   * kSlowBlur * 0.65)
+kLateFam  = kLateFam  + ((1 - kLateFam)  * kSlowBlur * 0.65)
+
+kWF1  = kW1  * kEarlyFam
+kWF2  = kW2  * kEarlyFam
+kWF3  = kW3  * kEarlyFam
+kWF4  = kW4  * kEarlyFam
+kWF5  = kW5  * kEarlyFam
+kWF6  = kW6  * kMidFam
+kWF7  = kW7  * kMidFam
+kWF8  = kW8  * kMidFam
+kWF9  = kW9  * kMidFam
+kWF10 = kW10 * kMidFam
+kWF11 = kW11 * kMidFam
+kWF12 = kW12 * kLateFam
+kWF13 = kW13 * kLateFam
+kWF14 = kW14 * kLateFam
+kWF15 = kW15 * kLateFam
+kWF16 = kW16 * kLateFam
+kWFSum = kWF1 + kWF2 + kWF3 + kWF4 + kWF5 + kWF6 + kWF7 + kWF8 + kWF9 + kWF10 + kWF11 + kWF12 + kWF13 + kWF14 + kWF15 + kWF16
+kWNorm = 1 / max(kWFSum, 0.0001)
+
+; Per-group timbral coloring — taps split into 4 families before summing so echoes
+; arrive as distinct objects rather than identical copies.
+; Early (1-4): LPF muffle — old tape, dark and indistinct
+aGroupEarlyL = (aTap1L*kWF1 + aTap2L*kWF2 + aTap3L*kWF3 + aTap4L*kWF4) * kWNorm
+aGroupEarlyR = (aTap1R*kWF1 + aTap2R*kWF2 + aTap3R*kWF3 + aTap4R*kWF4) * kWNorm
+aGroupEarlyL tone aGroupEarlyL, limit(kCutoffMain * 0.32, 80, 3200)
+aGroupEarlyR tone aGroupEarlyR, limit(kCutoffMain * 0.32, 80, 3200)
+; Mid-early (5-9): mild tanh drive — slight grit
+aGroupMidEL = (aTap5L*kWF5 + aTap6L*kWF6 + aTap7L*kWF7 + aTap8L*kWF8 + aTap9L*kWF9) * kWNorm
+aGroupMidER = (aTap5R*kWF5 + aTap6R*kWF6 + aTap7R*kWF7 + aTap8R*kWF8 + aTap9R*kWF9) * kWNorm
+aGroupMidEL = tanh(aGroupMidEL * 1.40)
+aGroupMidER = tanh(aGroupMidER * 1.40)
+; Mid-late (10-13): natural midrange, unprocessed
+aGroupMidLL = (aTap10L*kWF10 + aTap11L*kWF11 + aTap12L*kWF12 + aTap13L*kWF13) * kWNorm
+aGroupMidLR = (aTap10R*kWF10 + aTap11R*kWF11 + aTap12R*kWF12 + aTap13R*kWF13) * kWNorm
+; Tail (14-16): tanh drive + HP — harmonically distinct, airier residue
+aGroupTailL = (aTap14L*kWF14 + aTap15L*kWF15 + aTap16L*kWF16) * kWNorm
+aGroupTailR = (aTap14R*kWF14 + aTap15R*kWF15 + aTap16R*kWF16) * kWNorm
+aGroupTailL = tanh(aGroupTailL * 1.60)
+aGroupTailR = tanh(aGroupTailR * 1.60)
+aGroupTailL atone aGroupTailL, max(kCutoffMain * 0.38, 120)
+aGroupTailR atone aGroupTailR, max(kCutoffMain * 0.38, 120)
+
+aTapSumL = aGroupEarlyL + aGroupMidEL + aGroupMidLL + aGroupTailL
+aTapSumR = aGroupEarlyR + aGroupMidER + aGroupMidLR + aGroupTailR
+; Ghost output path: mid-late + tail fade from output only; full sum still drives AP + feedback
+kGhostFade   = 1 - kGhostTails
+aTapSumOutL  = aGroupEarlyL + aGroupMidEL + aGroupMidLL * kGhostFade + aGroupTailL * kGhostFade
+aTapSumOutR  = aGroupEarlyR + aGroupMidER + aGroupMidLR * kGhostFade + aGroupTailR * kGhostFade
+
+; ------------------------------------------------------------
+; Allpass diffuser with feedback — depth keyed to Absorb
+; Low Absorb (dark): heavy diffusion → tap cloud; High Absorb (bright): articulate echoes
+; 2 stages × (223 + 307 samples) + feedback extends smear to ~50-70ms range
+; ------------------------------------------------------------
+kAPGain  = (1 - kAbsorb) * 0.58    ; allpass gain: 0 at full bright, 0.58 at full dark
+kFbCoef  = (1 - kAbsorb) * 0.35 * kFbDamp    ; feedback depth: extends effective smear time; damped during speed changes
+kAPBlend = 1 - kAbsorb              ; wet/dry: fully diffused at dark, fully dry at bright
+kDiffT1  = 223.0 / sr               ; ~4.6ms
+kDiffT2  = 307.0 / sr               ; ~6.4ms
+
+aDiffFbL init 0
+aDiffFbR init 0
+
+; Stage 1 — L
+aD1InL   = aTapSumL + kFbCoef * aDiffFbL
+aDB1L    delayr 0.02
+aDT1L    deltap3 a(kDiffT1)
+aDW1L    = aD1InL + kAPGain * aDT1L
+           delayw aDW1L
+aDAP1L   = aDT1L - kAPGain * aDW1L
+; Stage 2 — L
+aDB2L    delayr 0.02
+aDT2L    deltap3 a(kDiffT2)
+aDW2L    = aDAP1L + kAPGain * aDT2L
+           delayw aDW2L
+aDAP2L   = aDT2L - kAPGain * aDW2L
+aDiffFbL = aDAP2L
+
+; Stage 1 — R
+aD1InR   = aTapSumR + kFbCoef * aDiffFbR
+aDB1R    delayr 0.02
+aDT1R    deltap3 a(kDiffT1)
+aDW1R    = aD1InR + kAPGain * aDT1R
+           delayw aDW1R
+aDAP1R   = aDT1R - kAPGain * aDW1R
+; Stage 2 — R
+aDB2R    delayr 0.02
+aDT2R    deltap3 a(kDiffT2)
+aDW2R    = aDAP1R + kAPGain * aDT2R
+           delayw aDW2R
+aDAP2R   = aDT2R - kAPGain * aDW2R
+aDiffFbR = aDAP2R
+
+aTapSumDiffL = aDAP2L * kAPBlend + aTapSumL * (1 - kAPBlend)        ; full — feedback + self-feed
+aTapSumDiffR = aDAP2R * kAPBlend + aTapSumR * (1 - kAPBlend)
+aTapSumDiffOutL = aDAP2L * kAPBlend + aTapSumOutL * (1 - kAPBlend)  ; ghost-reduced — output only
+aTapSumDiffOutR = aDAP2R * kAPBlend + aTapSumOutR * (1 - kAPBlend)
+
+; ------------------------------------------------------------
+; Multi-branch feedback: dark, main, and bright return paths.
+; Each branch owns different taps and filtering so the loop can accumulate unevenly.
+; ------------------------------------------------------------
+
+; Main branch
+aFbMainSrcL = aTap9L + aTap10L * 0.55 + aTap7L * 0.18
+aFbMainSrcR = aTap9R + aTap10R * 0.55 + aTap7R * 0.18
+aFbMainToneL tone aFbMainSrcL, kPostBW
+aFbMainToneR tone aFbMainSrcR, kPostBW
+aFbMainL K35_lpf aFbMainToneL, kCutoffMain, kQMain
+aFbMainR K35_lpf aFbMainToneR, kCutoffMain, kQMain
+
+; Dark branch
+aFbDarkSrcL = aTap6L * 0.55 + aTap8L * 0.70
+aFbDarkSrcR = aTap6R * 0.55 + aTap8R * 0.70
+aFbDarkPreL = tanh(aFbDarkSrcL * (1.20 + (1 - kAbsorb) * 0.35))
+aFbDarkPreR = tanh(aFbDarkSrcR * (1.20 + (1 - kAbsorb) * 0.35))
+aFbDarkToneL tone aFbDarkPreL, kPostBW * 0.58
+aFbDarkToneR tone aFbDarkPreR, kPostBW * 0.58
+aFbDarkL K35_lpf aFbDarkToneL, kCutoffDark, kQDark
+aFbDarkR K35_lpf aFbDarkToneR, kCutoffDark, kQDark
+
+; Bright branch — uses tail taps for spacious character
+aFbBrightSrcL = aTap3L * 0.35 + aTap13L * 0.55 + aTap15L * 0.65 + aTap16L * 0.55
+aFbBrightSrcR = aTap3R * 0.35 + aTap13R * 0.55 + aTap15R * 0.65 + aTap16R * 0.55
+aFbBrightDrvL = tanh(aFbBrightSrcL * (1.55 + kAbsorb * 1.10))
+aFbBrightDrvR = tanh(aFbBrightSrcR * (1.55 + kAbsorb * 1.10))
+aFbBrightShpInL limit aFbBrightDrvL, -1, 1
+aFbBrightShpInR limit aFbBrightDrvR, -1, 1
+aFbBrightChebyL table3 (aFbBrightShpInL * 0.5) + 0.5, giBruxaCheby, 1
+aFbBrightChebyR table3 (aFbBrightShpInR * 0.5) + 0.5, giBruxaCheby, 1
+aFbBrightHP_L atone aFbBrightChebyL, max(kPostBW * 0.62, 140)
+aFbBrightHP_R atone aFbBrightChebyR, max(kPostBW * 0.62, 140)
+aFbBrightL K35_lpf aFbBrightHP_L, kCutoffBright, kQBright
+aFbBrightR K35_lpf aFbBrightHP_R, kCutoffBright, kQBright
+
+; Absorb now exposes branch imbalance instead of just crossfading cleanliness.
+kRecircDark   = (1 - kAbsorb)^1.6
+kRecircMain   = 1 - (kAbsorb * 0.42)
+kRecircBright = 0.16 + kAbsorb * 0.94
+kLossBright   = kAbsorb^1.18
+kLossDark     = (1 - kAbsorb)^0.72
+
+aLossL = aFbBrightL * (0.44 + kLossBright * 0.72) + aFbDarkL * 0.10 * kLossDark
+aLossR = aFbBrightR * (0.44 + kLossBright * 0.72) + aFbDarkR * 0.10 * kLossDark
+
+aFbRecircL = (aFbDarkL * 0.42 * kRecircDark) + (aFbMainL * 0.54 * kRecircMain) + (aFbBrightL * 0.30 * kRecircBright)
+aFbRecircR = (aFbDarkR * 0.42 * kRecircDark) + (aFbMainR * 0.54 * kRecircMain) + (aFbBrightR * 0.30 * kRecircBright)
+
+aFbRecircL = tanh(aFbRecircL * (1.12 + (1 - kAbsorb) * 0.20))
+aFbRecircR = tanh(aFbRecircR * (1.12 + (1 - kAbsorb) * 0.20))
+
+aFbPreClipL = (aFbRecircL * kDecayGain * kFbDamp) + (aLossL * 0.16)
+aFbPreClipR = (aFbRecircR * kDecayGain * kFbDamp) + (aLossR * 0.16)
+
+; B1+B2 — tap self-feed: accumulates over ~8s, each press deepens the second loop
+kTapSelfAmt portk kAccumB1B2 * 0.18, 0.05
+aFbPreClipL = aFbPreClipL + (aTapSumDiffL * kTapSelfAmt)
+aFbPreClipR = aFbPreClipR + (aTapSumDiffR * kTapSelfAmt)
+
+; Noise floor: scales with delay time (longer delay = lower clock = more delta-sigma noise)
+kNoiseAmp  = kPTDegrade * 0.003
+aNoiseL    rand kNoiseAmp
+aNoiseR    rand kNoiseAmp
+aDustL     rand kNoiseAmp * (0.30 + kAbsorb * 0.80)
+aDustR     rand kNoiseAmp * (0.30 + kAbsorb * 0.80)
+aCrinkleNoiseL rand kNoiseAmp * (4.0 + (16.0 * kDropCrinkleDepth))
+aCrinkleNoiseR rand kNoiseAmp * (4.0 + (16.0 * kDropCrinkleDepth))
+aPopNoiseL     rand kNoiseAmp * (3.0 + (14.0 * kSnagPopDepth))
+aPopNoiseR     rand kNoiseAmp * (3.0 + (14.0 * kSnagPopDepth))
+aCrinkleL      atone aCrinkleNoiseL, kCrinkleHighpassHz
+aCrinkleR      atone aCrinkleNoiseR, kCrinkleHighpassHz
+aPopL          atone aPopNoiseL, kPopHighpassHz
+aPopR          atone aPopNoiseR, kPopHighpassHz
+aCrinkleL      tone aCrinkleL, kCrinkleLowpassHz
+aCrinkleR      tone aCrinkleR, kCrinkleLowpassHz
+aPopL          tone aPopL, kPopLowpassHz
+aPopR          tone aPopR, kPopLowpassHz
+aCrinkleAmtL   = (kCrinkleEnvL^1.1) * kCrinkleLevel
+aCrinkleAmtR   = (kCrinkleEnvR^1.1) * kCrinkleLevel
+aCrinkleL      = aCrinkleL * limit(aCrinkleAmtL, 0, 1)
+aCrinkleR      = aCrinkleR * limit(aCrinkleAmtR, 0, 1)
+aPopL          = aPopL * ((kPopEnvL^1.15) * kPopLevel)
+aPopR          = aPopR * ((kPopEnvR^1.15) * kPopLevel)
+
+; Output branch: full tap cloud + loss residue + noise floor
+aWetCoreL  = aTapSumDiffOutL + aLossL * 0.42 + (aDustL * aFbBrightChebyL * 0.08) + aNoiseL
+aWetCoreR  = aTapSumDiffOutR + aLossR * 0.42 + (aDustR * aFbBrightChebyR * 0.08) + aNoiseR
+aWetBaseL  = aWetCoreL + (aCrinkleL * aWetCoreL) + aPopL
+aWetBaseR  = aWetCoreR + (aCrinkleR * aWetCoreR) + aPopR
+aHeadLossL atone aWetBaseL, kHeadLossHighpassHz
+aHeadLossR atone aWetBaseR, kHeadLossHighpassHz
+aHeadLossL tone aHeadLossL, kHeadLossLowpassHz
+aHeadLossR tone aHeadLossR, kHeadLossLowpassHz
+; Drop/crinkle → head loss; snag also adds HF darkening via head loss path
+aHeadLossAmtL = (kDropBed * kHeadLossBedDepth) + ((kDropEnvL^1.4) * kHeadLossDepth) + ((kSnagEnvL^1.2) * kSnagHFLossDepth)
+aHeadLossAmtR = (kDropBed * kHeadLossBedDepth) + ((kDropEnvR^1.4) * kHeadLossDepth) + ((kSnagEnvR^1.2) * kSnagHFLossDepth)
+aHeadLossL = aHeadLossL * limit(aHeadLossAmtL, 0, 1)
+aHeadLossR = aHeadLossR * limit(aHeadLossAmtR, 0, 1)
+; Snag also ducks output level (tape slipping = brief signal loss, not pitch sweep)
+kSnagDuckL = 1 - ((kSnagEnvL^1.2) * kSnagDuckDepth)
+kSnagDuckR = 1 - ((kSnagEnvR^1.2) * kSnagDuckDepth)
+aWetEventL = (aWetBaseL - aHeadLossL) * kWetDropGainL * kSnagDuckL
+aWetEventR = (aWetBaseR - aHeadLossR) * kWetDropGainR * kSnagDuckR
+aFailureLoopL = ((aCrinkleL * aWetCoreL) + aPopL - aHeadLossL) * kFailureToLoopGain
+aFailureLoopR = ((aCrinkleR * aWetCoreR) + aPopR - aHeadLossR) * kFailureToLoopGain
+aFbPreClipL = aFbPreClipL + aFailureLoopL
+aFbPreClipR = aFbPreClipR + aFailureLoopR
+aPostL tone aWetEventL, kPostBW
+aPostR tone aWetEventR, kPostBW
+aFilteredL K35_lpf aPostL, kCutoffMain, kQMain
+aFilteredR K35_lpf aPostR, kCutoffMain, kQMain
+
+; B1+B3 — output fold: accumulates over ~8s, second loop deepens with each press
+kOutputFoldAmt portk kAccumB1B3 * 0.14, 0.05
+aMixL = aMixL + (aFilteredL * kOutputFoldAmt)
+aMixR = aMixR + (aFilteredR * kOutputFoldAmt)
+
+; Soft saturation (tanh-like via squishing): keeps feedback musical
+; Using tanh approximation via existing clip pattern (clip is confirmed hardware)
+aFeedbackL tanh aFbPreClipL
+aFeedbackR tanh aFbPreClipR
+
+; Hard safety clamp
+aFeedbackL clip aFeedbackL, 0, 0.92
+aFeedbackR clip aFeedbackR, 0, 0.92
+
+; ------------------------------------------------------------
+; Interference CV: envelope follower on internal feedback loop
+; Exposed via gkInterference for self-patching use cases
+; (In hardware, this would drive a CV output jack)
+; ------------------------------------------------------------
+
+kInterference rms (aFbRecircL + aLossL * 0.5)
+gkInterference = kInterference    ; available for external use / monitoring
+
+; ------------------------------------------------------------
+; Clock whistle: simulates PT2399 VCO clock leakage
+; Very low amplitude, inversely pitched to delay time
+; ------------------------------------------------------------
+
+aWhistle poscil kWhistleAmp, kWhistleFreq, 1
+
+; ------------------------------------------------------------
+; Output mix: dry/wet blend (Equal Power)
+; ------------------------------------------------------------
+
+kDry = cos(kBlend * 1.57079632)
+kWet = sin(kBlend * 1.57079632)
+
+aWetL = aFilteredL + aWhistle
+aWetR = aFilteredR + aWhistle
+
+aOutL = (aSrcL * kDry) + (aWetL * kWet)
+aOutR = (aSrcR * kDry) + (aWetR * kWet)
+
+; Final output safety clip
+aOutL clip aOutL, 0, 0.95
+aOutR clip aOutR, 0, 0.95
+
+outs aOutL, aOutR
+
+endin

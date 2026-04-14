@@ -1,0 +1,1273 @@
+nebconfigbegin
+sr,48000
+ksmps,64
+-B,2048
+-b,512
+freeze,latching,rising
+file,triggered,rising
+record,triggered,rising
+reset,triggered,rising
+nebconfigend
+
+/****************
+ Kandahar to Havana — 4-Channel Linked Delay with Cascading feedback loop
+ Inspired by Xaoc Devices Samarkanda linked mode and Pittsburgh Modular Cascading Delay
+
+ Architecture Overview:
+   This file is a stereo 4-stage delay network with a fixed serial audio path:
+     Left In  -> [A] -> [B] -> [C] -> [D] -> output blend -> Left Out
+     Right In -> [A] -> [B] -> [C] -> [D] -> output blend -> Right Out
+
+   The audio path is always serial. What changes at runtime is:
+     1. time-control topology    (freeze_alt cycle)
+     2. analog/digital branch per stage  (file cycle)
+     3. feedback cascade matrix  (record cycle)
+     4. same-stage L/R crossfeed ladder  (size_alt)
+
+   So there are three separate architecture layers:
+     A. signal path layer
+        always A -> B -> C -> D per side
+     B. time-control layer
+        decides whether stages are linked, paired, or independent
+     C. feedback-routing layer
+        decides which delayed outputs feed which stage inputs
+
+ Stage Mix Laws:
+   A uses the original 2-source law:
+     mix_A = crossfade(stage input, A tap)
+
+   B/C/D use a 3-region law:
+     left   region = external dry input for that side
+     middle region = previous stage mixed output
+     right  region = this stage tap
+
+   This means B/C/D can behave as:
+     - source-parallel taps
+     - serial cascade stages
+     - stage-local wet taps
+
+ Time-Control Topologies (freeze_alt cycle):
+   0. ABCD linked
+      A is the master time, B/C/D follow by ratio
+   1. AB + CD pairs
+      A is master for B, C is master for D
+   2. independent
+      A/B/C/D each use their own time law
+
+ Stage Mode Patterns (file cycle):
+   0. ABCD analog
+   1. A analog, BCD digital
+   2. AB analog, CD digital
+   3. BC analog, AD digital
+   4. ABCD digital
+
+ Cascade Feedback Modes (record cycle):
+   record advances:
+     5 -> 1A -> 1B -> 2A -> 2B -> 3A -> 3B -> 3C -> 4A -> 4B -> 5
+
+   These are applied per side first.
+   After that, size_alt can replace same-stage feedback with opposite-side
+   same-stage feedback in this order:
+     0 none
+     1 D only
+     2 C + D
+     3 B + C + D
+     4 A + B + C + D
+
+ Analog Tracking Law (BBD/tape model):
+   Each stage stores a tracked effective delay `kD_*`.
+   On target change:
+     kRate = old_delay / new_delay
+   Then `kD_*` is moved toward the new target with that fixed retime ratio.
+   This is an approximation of tape/BBD retiming on top of `deltap3`.
+
+ Digital Time-Change Mode:
+   Each stage keeps:
+     - current read time
+     - old read time
+     - new read time
+     - one queued destination
+     - fade progress
+   Target changes therefore crossfade between old and new read taps instead
+   of repitching like the analog branch.
+
+ Hold / Purge:
+   freeze is a global hold.
+   record_alt is purge.
+
+   Hold latches per-stage reference state at hold-entry:
+     - hold-entry target time
+     - analog tracked delay state
+     - digital read position
+     - per-stage analog/digital branch choice
+
+   While hold is active, the write head recirculates a fixed hold-reference tap
+   instead of the live selected tap. This prevents time modulation from
+   rewriting the held buffer from the moving live branch.
+
+   Purge is also the global state reset:
+     - clears delay memory
+     - resets cascade mode to 5
+     - resets stage-mode cycle to ABCD analog
+     - resets topology cycle to ABCD linked
+
+ Controls — Main Layer:
+   start    - A delay time, 12.5ms to 5s exponential
+   density  - A feedback
+   blend    - A mix  (stage A → B passthrough blend, default full wet)
+   speed    - B delay time (15-step clock ratio in clocked mode)
+   density_alt - B feedback
+   blend_alt   - B mix  (stage B → C passthrough blend, default full wet)
+   size     - C delay time (15-step clock ratio in clocked mode)
+   overlap  - C feedback
+   window   - C mix  (stage C → D passthrough blend, default full wet)
+   pitch    - D delay time (15-step clock ratio in clocked mode)
+
+ Controls — Alt Layer:
+   pitch_alt   - final dry/wet (input vs stage D output)
+   start_alt   - stereo skew mode (7-step selector: 0=none, 1–6=increasing offset/spread presets)
+   size_alt    - same-stage L/R crossfeed ladder
+                 0=none, 1=D, 2=C+D, 3=B+C+D, 4=A+B+C+D
+   file_alt    - mono input engage (sum L+R into both delay chains)
+   overlap_alt - feedback D
+   window_alt  - mix D  (stage D → output blend, default full wet)
+
+Buttons:
+   reset     - clock input (triggered, rising)
+   reset_alt - unused
+   file      - stage mode cycle:
+               0=ABCD analog
+               1=A analog, BCD digital
+               2=AB analog, CD digital
+               3=BC analog, AD digital
+               4=ABCD digital
+   record    - cascade feedback mode cycle
+   record_alt - purge (clear all delay buffers)
+   freeze    - global hold
+   freeze_alt - topology cycle: 0=ABCD linked, 1=AB + CD pairs, 2=independent
+****************/
+
+opcode RatioQuantize, kk, kk
+  kKnob, kIdxLatched xin
+  kRatioTable[] fillarray 0.125, 0.16667, 0.2, 0.25, 0.33333, 0.5, 0.66667, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0
+  kKnobClamped limit kKnob, 0, 1
+  kIdxRaw scale kKnobClamped, 14.999, 0
+  kIdx floor kIdxRaw
+  if (changed(kIdx) == 1) then
+    kIdxLatched = kIdx
+  endif
+  kRatio = kRatioTable[kIdxLatched]
+  xout kIdxLatched, kRatio
+endop
+
+opcode AnalogTrack, kkk, kkkkk
+  kTarget, kLastTarget, kRate, kD, kTol xin
+  if (abs(kTarget - kLastTarget) > kTol) then
+    kRate = kLastTarget / kTarget
+    kLastTarget = kTarget
+  endif
+
+  if (abs(kD - kTarget) > kTol) then
+    kD = kD + ((1 - kRate) / kr)
+    if ((kRate > 1) && (kD <= kTarget)) then
+      kD = kTarget
+      kRate = 1
+    elseif ((kRate < 1) && (kD >= kTarget)) then
+      kD = kTarget
+      kRate = 1
+    endif
+  else
+    kD = kTarget
+    kRate = 1
+  endif
+
+  xout kLastTarget, kRate, kD
+endop
+
+opcode DigXfade, kkkkkk, kkkkkkkkk
+  kTarget, kDigRead, kDigOld, kDigNew, kDigQueued, kDigQueue, kDigX, kTargetTol, kDigStep xin
+
+  if (abs(kTarget - kDigRead) > kTargetTol) then
+    if (kDigX >= 1) then
+      kDigOld = kDigRead
+      kDigNew = kTarget
+      kDigX = 0
+    elseif (abs(kTarget - kDigNew) > kTargetTol) then
+      kDigQueued = kTarget
+      kDigQueue = 1
+    endif
+  endif
+
+  kDigX min 1, (kDigX + kDigStep)
+
+  if (kDigX >= 1) then
+    kDigRead = kDigNew
+    if (kDigQueue == 1) then
+      kDigOld = kDigRead
+      kDigNew = kDigQueued
+      kDigQueue = 0
+      kDigX = 0
+    endif
+  endif
+
+  xout kDigRead, kDigOld, kDigNew, kDigQueued, kDigQueue, kDigX
+endop
+
+opcode HoldRestore, kkkkkkkk, kkkkkkkkkkkkk
+  kTarget, kHoldTarget, kHoldAnalog, kHoldDigital, kTol, kD, kRate, kLastTarget, kDigRead, kDigOld, kDigNew, kDigQueue, kDigX xin
+  if (abs(kTarget - kHoldTarget) <= kTol) then
+    kD = kHoldAnalog
+    kRate = 1
+    kLastTarget = kHoldTarget
+    kDigRead = kHoldDigital
+    kDigOld = kHoldDigital
+    kDigNew = kHoldDigital
+    kDigQueue = 0
+    kDigX = 1
+  endif
+  xout kD, kRate, kLastTarget, kDigRead, kDigOld, kDigNew, kDigQueue, kDigX
+endop
+
+
+instr 1
+
+; ------------------------------------------------------------
+; Init and Variables
+;
+; Most state in this file belongs to one of four systems:
+;   1. clock / master-time detection
+;   2. analog tracked-delay state
+;   3. digital queued-read crossfade state
+;   4. hold snapshots
+;
+; The file keeps these explicitly per stage and per stereo side.
+; ------------------------------------------------------------
+
+kInit             init 4          ; skip first k-cycles from clock measurement
+
+kClockIn          init 0
+kClockIn_time     init 0
+kClockIn_time_old init 0
+kClockSeen_sec    init 0
+kIntervalCnt      init -1
+gkClock_tick      init 0
+
+gkMetroIn         init 0
+gkMetroOn         init 0
+
+kPulseTime_ms     init 0
+kInterval         init 0
+kAverageDelay_temp init 0.34
+kIntervalArr[]    init 4
+kIntervalArr_len  init 4
+kPurgeTime_sec    init 0
+kHoldPrev         init 0
+kHoldMode_A       init 0
+kHoldMode_B       init 0
+kHoldMode_C       init 0
+kHoldMode_D       init 0
+kTopologyPrev     init 0
+kTopologyXfade    init 1
+kFbRouteXfade     init 1
+kModeXfade        init 1
+kCascadeMode      init 0
+kTopologyMode     init 0
+kStageModeCycle   init 0
+
+iCalcDelay        init 0.34
+kAverageDelay     init iCalcDelay
+gkMasterTime_sec  init iCalcDelay
+kClockBaseLatched init iCalcDelay
+kClockBasePending init iCalcDelay
+kClockStableCount init 0
+iMaxDelayTime     init 10.0
+kRatioIdx_A_latched init 7
+kRatioIdx_B_latched init 7
+kRatioIdx_C_latched init 7
+kRatioIdx_D_latched init 7
+kRatio_A init 1.0
+kRatio_B init 1.0
+kRatio_C init 1.0
+kRatio_D init 1.0
+
+; Analog tracking state — one per channel
+kD_A_L init iCalcDelay
+kD_A_R init iCalcDelay
+kD_B_L init iCalcDelay
+kD_B_R init iCalcDelay
+kD_C_L init iCalcDelay
+kD_C_R init iCalcDelay
+kD_D_L init iCalcDelay
+kD_D_R init iCalcDelay
+kRate_A_L init 1
+kRate_A_R init 1
+kRate_B_L init 1
+kRate_B_R init 1
+kRate_C_L init 1
+kRate_C_R init 1
+kRate_D_L init 1
+kRate_D_R init 1
+kLastTarget_A_L init iCalcDelay
+kLastTarget_A_R init iCalcDelay
+kLastTarget_B_L init iCalcDelay
+kLastTarget_B_R init iCalcDelay
+kLastTarget_C_L init iCalcDelay
+kLastTarget_C_R init iCalcDelay
+kLastTarget_D_L init iCalcDelay
+kLastTarget_D_R init iCalcDelay
+
+; Hold snapshot state — one per stage and side.
+; These are the reference values used by the hold playback path.
+kHoldTarget_A_L init iCalcDelay
+kHoldTarget_A_R init iCalcDelay
+kHoldTarget_B_L init iCalcDelay
+kHoldTarget_B_R init iCalcDelay
+kHoldTarget_C_L init iCalcDelay
+kHoldTarget_C_R init iCalcDelay
+kHoldTarget_D_L init iCalcDelay
+kHoldTarget_D_R init iCalcDelay
+kHoldAnalog_A_L init iCalcDelay
+kHoldAnalog_A_R init iCalcDelay
+kHoldAnalog_B_L init iCalcDelay
+kHoldAnalog_B_R init iCalcDelay
+kHoldAnalog_C_L init iCalcDelay
+kHoldAnalog_C_R init iCalcDelay
+kHoldAnalog_D_L init iCalcDelay
+kHoldAnalog_D_R init iCalcDelay
+kHoldDigital_A_L init iCalcDelay
+kHoldDigital_A_R init iCalcDelay
+kHoldDigital_B_L init iCalcDelay
+kHoldDigital_B_R init iCalcDelay
+kHoldDigital_C_L init iCalcDelay
+kHoldDigital_C_R init iCalcDelay
+kHoldDigital_D_L init iCalcDelay
+kHoldDigital_D_R init iCalcDelay
+
+; Digital crossfade state — one per stage and side.
+; This is the queued read-head engine for the digital branch.
+kDigRead_A_L init iCalcDelay
+kDigRead_A_R init iCalcDelay
+kDigRead_B_L init iCalcDelay
+kDigRead_B_R init iCalcDelay
+kDigRead_C_L init iCalcDelay
+kDigRead_C_R init iCalcDelay
+kDigRead_D_L init iCalcDelay
+kDigRead_D_R init iCalcDelay
+kDigOld_A_L init iCalcDelay
+kDigOld_A_R init iCalcDelay
+kDigOld_B_L init iCalcDelay
+kDigOld_B_R init iCalcDelay
+kDigOld_C_L init iCalcDelay
+kDigOld_C_R init iCalcDelay
+kDigOld_D_L init iCalcDelay
+kDigOld_D_R init iCalcDelay
+kDigNew_A_L init iCalcDelay
+kDigNew_A_R init iCalcDelay
+kDigNew_B_L init iCalcDelay
+kDigNew_B_R init iCalcDelay
+kDigNew_C_L init iCalcDelay
+kDigNew_C_R init iCalcDelay
+kDigNew_D_L init iCalcDelay
+kDigNew_D_R init iCalcDelay
+kDigQueued_A_L init iCalcDelay
+kDigQueued_A_R init iCalcDelay
+kDigQueued_B_L init iCalcDelay
+kDigQueued_B_R init iCalcDelay
+kDigQueued_C_L init iCalcDelay
+kDigQueued_C_R init iCalcDelay
+kDigQueued_D_L init iCalcDelay
+kDigQueued_D_R init iCalcDelay
+kDigQueue_A_L init 0
+kDigQueue_A_R init 0
+kDigQueue_B_L init 0
+kDigQueue_B_R init 0
+kDigQueue_C_L init 0
+kDigQueue_C_R init 0
+kDigQueue_D_L init 0
+kDigQueue_D_R init 0
+kDigX_A_L init 1
+kDigX_A_R init 1
+kDigX_B_L init 1
+kDigX_B_R init 1
+kDigX_C_L init 1
+kDigX_C_R init 1
+kDigX_D_L init 1
+kDigX_D_R init 1
+
+; Output feedback damping
+kOutputDelayDamping init 1
+
+; A-rate inits required by HARD_RULES Law of A-Rate Initialization
+aFb_A_L init 0
+aFb_A_R init 0
+aFb_B_L init 0
+aFb_B_R init 0
+aFb_C_L init 0
+aFb_C_R init 0
+aFb_D_L init 0
+aFb_D_R init 0
+
+; Control aliases — main layer
+gkMasterTimeKnob = gkloopstart
+gkRatio_B_knob   = gkspeed
+gkRatio_C_knob   = gkloopsize
+gkRatio_D_knob   = gkpitch
+gkFeedbackA_knob = gkdensity
+gkMix_A_knob     = gkblend
+gkFeedbackB_knob = gkdensity_alt
+gkMix_B_knob     = gkblend_alt
+gkFeedbackC_knob = gkoverlap
+gkMix_C_knob     = gkwindow
+
+; Control aliases — alt layer
+gkBlend_knob     = gkpitch_alt
+gkSkew_knob      = gkloopstart_alt
+gkFbRoute_knob   = gkloopsize_alt
+gkMonoInput      = gkfile_alt
+gkFeedbackD_knob = gkoverlap_alt
+gkMix_D_knob     = gkwindow_alt
+
+; Button aliases
+gkClockIn        = gkreset
+gkTopologyStep   = gkfreeze_alt
+gkHold           = gkfreeze
+gkCascadeStep    = gkrecord
+gkPurge          = gkrecord_alt
+gkStageModeStep  = gkfilesel
+
+
+; ------------------------------------------------------------
+; Input
+; ------------------------------------------------------------
+
+aInputL_org, aInputR_org inch 1, 2
+aInputL = aInputL_org * a(0.9)
+aInputR = aInputR_org * a(0.9)
+
+if (gkMonoInput == 1) then
+  aInputSum = (aInputL + aInputR) * 0.7
+  aInputL = aInputSum
+  aInputR = aInputSum
+endif
+
+
+; ------------------------------------------------------------
+; Clock
+; ------------------------------------------------------------
+
+kClockIn trigger gkClockIn, 0.5, 0
+if (gkMetroOn == 1) then
+  turnoff2 2, 0, 1
+  gkMetroOn = 0
+endif
+
+if (timeinstk() == 0) then
+  kIntervalArr[0] = iCalcDelay
+  kIntervalArr[1] = iCalcDelay
+  kIntervalArr[2] = iCalcDelay
+  kIntervalArr[3] = iCalcDelay
+endif
+
+if ((kClockIn == 1) || (gkMetroIn == 1)) then
+  kClockIn_time_old = kClockIn_time
+  kClockIn_time     timeinsts
+  kClockSeen_sec    = kClockIn_time
+
+  if (kInit == 0) then
+    kInterval = kClockIn_time - kClockIn_time_old
+
+    kIntervalCnt = ((kIntervalCnt + 1) % kIntervalArr_len)
+    if (kInterval < (iMaxDelayTime - 0.1)) then
+      kIntervalArr[kIntervalCnt]  = kInterval
+      kAverageDelay_temp          = kIntervalArr[0]
+      kAverageDelay_temp         += kIntervalArr[1]
+      kAverageDelay_temp         += kIntervalArr[2]
+      kAverageDelay_temp         += kIntervalArr[3]
+      kAverageDelay_temp          = kAverageDelay_temp / kIntervalArr_len
+    endif
+
+    kAverageDelay = kAverageDelay_temp
+    if (kAverageDelay == 0) then
+      kAverageDelay = iCalcDelay
+    endif
+
+    kClockChangeThresh = max((2 / kr), (kClockBaseLatched * 0.02))
+    if (abs(kAverageDelay - kClockBasePending) > kClockChangeThresh) then
+      kClockBasePending = kAverageDelay
+      kClockStableCount = 1
+    else
+      kClockStableCount = min(kClockStableCount + 1, 4)
+    endif
+    if ((kClockStableCount >= 4) && (abs(kClockBasePending - kClockBaseLatched) > kClockChangeThresh)) then
+      kClockBaseLatched = kClockBasePending
+    endif
+  endif
+
+  gkClock_tick = 1
+endif
+
+kPurgeTrig trigger gkPurge, 0.5, 0
+if (kPurgeTrig == 1) then
+  kPurgeTime_sec = iMaxDelayTime + 0.1
+  kCascadeMode = 0
+  kStageModeCycle = 0
+  kTopologyMode = 0
+  kFbRouteXfade = 0
+  kModeXfade = 0
+  kTopologyXfade = 0
+endif
+kCascadeTrig trigger gkCascadeStep, 0.5, 0
+if (kCascadeTrig == 1) then
+  kCascadeMode = (kCascadeMode + 1) % 10
+  kFbRouteXfade = 0
+endif
+kStageModeTrig trigger gkStageModeStep, 0.5, 0
+if (kStageModeTrig == 1) then
+  kStageModeCycle = (kStageModeCycle + 1) % 5
+  kModeXfade = 0
+endif
+kTopologyTrig trigger gkTopologyStep, 0.5, 0
+if (kTopologyTrig == 1) then
+  kTopologyPrev = kTopologyMode
+  kTopologyMode = (kTopologyMode + 1) % 3
+  kTopologyXfade = 0
+endif
+kPurgeTime_sec = (kPurgeTime_sec > 0 ? kPurgeTime_sec - (1 / kr) : 0)
+kPurgeTime_sec max 0, kPurgeTime_sec
+kPurgeActive = (kPurgeTime_sec > 0 ? 1 : 0)
+kHoldActive = gkHold
+
+kModeXfade portk (kModeXfade < 1 ? 1 : kModeXfade), 0.02
+kModeXfade limit kModeXfade, 0, 1
+
+if (kStageModeCycle == 0) then
+  kDigital_A = 0
+  kDigital_B = 0
+  kDigital_C = 0
+  kDigital_D = 0
+elseif (kStageModeCycle == 1) then
+  kDigital_A = 0
+  kDigital_B = 1
+  kDigital_C = 1
+  kDigital_D = 1
+elseif (kStageModeCycle == 2) then
+  kDigital_A = 0
+  kDigital_B = 0
+  kDigital_C = 1
+  kDigital_D = 1
+elseif (kStageModeCycle == 3) then
+  kDigital_A = 1
+  kDigital_B = 0
+  kDigital_C = 0
+  kDigital_D = 1
+else
+  kDigital_A = 1
+  kDigital_B = 1
+  kDigital_C = 1
+  kDigital_D = 1
+endif
+
+kTopologyXfade portk (kTopologyXfade < 1 ? 1 : kTopologyXfade), 0.02
+kTopologyXfade limit kTopologyXfade, 0, 1
+
+kFbRouteStateRaw scale gkFbRoute_knob, 4.999, 0
+kFbRouteState = floor(kFbRouteStateRaw)
+if (changed(kFbRouteState) == 1) then
+  kFbRouteXfade = 0
+endif
+kFbRouteXfade portk (kFbRouteXfade < 1 ? 1 : kFbRouteXfade), 0.02
+kFbRouteXfade limit kFbRouteXfade, 0, 1
+
+kNow_sec timeinsts
+
+
+; ------------------------------------------------------------
+; Ratio Quantization (Samarkanda 15-step set)
+; ------------------------------------------------------------
+
+; do NOT portk before floor() — mars_affects:287
+kRatioIdx_A_latched, kRatio_A RatioQuantize gkMasterTimeKnob, kRatioIdx_A_latched
+kRatioIdx_B_latched, kRatio_B RatioQuantize gkRatio_B_knob, kRatioIdx_B_latched
+kRatioIdx_C_latched, kRatio_C RatioQuantize gkRatio_C_knob, kRatioIdx_C_latched
+kRatioIdx_D_latched, kRatio_D RatioQuantize gkRatio_D_knob, kRatioIdx_D_latched
+
+kRatio_A_knob_clamped limit gkMasterTimeKnob, 0, 1
+kRatio_B_knob_clamped limit gkRatio_B_knob, 0, 1
+kRatio_C_knob_clamped limit gkRatio_C_knob, 0, 1
+kRatio_D_knob_clamped limit gkRatio_D_knob, 0, 1
+
+if ((kNow_sec - kClockSeen_sec) <= 1.5) then
+  ; Auto-clocked when a valid pulse was seen within 1.5 s
+  gkMasterTime_sec = kClockBaseLatched * kRatio_A
+else
+  ; Freerun: cubic exponential mapping 12.5ms to 5s
+  gkMasterTime_sec scale gkMasterTimeKnob, k(5.0)^(1/3), k(0.0125)^(1/3)
+  gkMasterTime_sec = gkMasterTime_sec ^ 3
+endif
+
+; Target delay times
+kTarget_A_mode0 = gkMasterTime_sec
+kTarget_B_mode0 = gkMasterTime_sec * kRatio_B
+kTarget_C_mode0 = gkMasterTime_sec * kRatio_C
+kTarget_D_mode0 = gkMasterTime_sec * kRatio_D
+
+kTarget_A_mode1 = gkMasterTime_sec
+kTarget_B_mode1 = gkMasterTime_sec * kRatio_B
+kTarget_C_mode1 scale gkRatio_C_knob, k(5.0)^(1/3), k(0.0005)^(1/3)
+kTarget_C_mode1 = kTarget_C_mode1 ^ 3
+kTarget_D_mode1 = kTarget_C_mode1 * kRatio_D
+
+kTarget_A_mode2 = gkMasterTime_sec
+kTarget_B_mode2 scale gkRatio_B_knob, k(5.0)^(1/3), k(0.0005)^(1/3)
+kTarget_B_mode2 = kTarget_B_mode2 ^ 3
+kTarget_C_mode2 scale gkRatio_C_knob, k(5.0)^(1/3), k(0.0005)^(1/3)
+kTarget_C_mode2 = kTarget_C_mode2 ^ 3
+kTarget_D_mode2 scale gkRatio_D_knob, k(5.0)^(1/3), k(0.0005)^(1/3)
+kTarget_D_mode2 = kTarget_D_mode2 ^ 3
+
+if (kTopologyMode == 0) then
+  kTarget_A = kTarget_A_mode0
+  kTarget_B = kTarget_B_mode0
+  kTarget_C = kTarget_C_mode0
+  kTarget_D = kTarget_D_mode0
+elseif (kTopologyMode == 1) then
+  kTarget_A = kTarget_A_mode1
+  kTarget_B = kTarget_B_mode1
+  kTarget_C = kTarget_C_mode1
+  kTarget_D = kTarget_D_mode1
+else
+  kTarget_A = kTarget_A_mode2
+  kTarget_B = kTarget_B_mode2
+  kTarget_C = kTarget_C_mode2
+  kTarget_D = kTarget_D_mode2
+endif
+
+; Stereo skew amount and enable
+kSkewModeRaw scale gkSkew_knob, 6.999, 0
+kSkewMode = floor(kSkewModeRaw)
+if     (kSkewMode = 0) then
+  kDelaySkew_offset = 0
+  kDelaySkew_factor = 1
+elseif (kSkewMode = 1) then
+  kDelaySkew_offset = 0.0015
+  kDelaySkew_factor = 1
+elseif (kSkewMode = 2) then
+  kDelaySkew_offset = 1/8
+  kDelaySkew_factor = 2-(1/8)
+elseif (kSkewMode = 3) then
+  kDelaySkew_offset = 1/4
+  kDelaySkew_factor = 2
+elseif (kSkewMode = 4) then
+  kDelaySkew_offset = 1/3
+  kDelaySkew_factor = 2+(1/3)
+elseif (kSkewMode = 5) then
+  kDelaySkew_offset = 1/2
+  kDelaySkew_factor = 2+(1/2)
+else
+  kDelaySkew_offset = 2/3
+  kDelaySkew_factor = 2+(2/3)
+endif
+kDelaySkew_offset portk kDelaySkew_offset, 1
+kDelaySkew_factor portk kDelaySkew_factor, 1
+
+kTarget_A_L_center = kTarget_A
+kTarget_A_R_center = kTarget_A
+kTarget_B_L_center = kTarget_B
+kTarget_B_R_center = kTarget_B
+kTarget_C_L_center = kTarget_C
+kTarget_C_R_center = kTarget_C
+kTarget_D_L_center = kTarget_D
+kTarget_D_R_center = kTarget_D
+
+kTarget_A_L_skew = kTarget_A - ((kTarget_A * kDelaySkew_offset) / kDelaySkew_factor)
+kTarget_A_R_skew = kTarget_A +  (kTarget_A * kDelaySkew_offset)
+kTarget_B_L_skew = kTarget_B - ((kTarget_B * kDelaySkew_offset) / kDelaySkew_factor)
+kTarget_B_R_skew = kTarget_B +  (kTarget_B * kDelaySkew_offset)
+kTarget_C_L_skew = kTarget_C - ((kTarget_C * kDelaySkew_offset) / kDelaySkew_factor)
+kTarget_C_R_skew = kTarget_C +  (kTarget_C * kDelaySkew_offset)
+kTarget_D_L_skew = kTarget_D - ((kTarget_D * kDelaySkew_offset) / kDelaySkew_factor)
+kTarget_D_R_skew = kTarget_D +  (kTarget_D * kDelaySkew_offset)
+
+kTarget_A_L = kTarget_A_L_skew
+kTarget_A_R = kTarget_A_R_skew
+kTarget_B_L = kTarget_B_L_skew
+kTarget_B_R = kTarget_B_R_skew
+kTarget_C_L = kTarget_C_L_skew
+kTarget_C_R = kTarget_C_R_skew
+kTarget_D_L = kTarget_D_L_skew
+kTarget_D_R = kTarget_D_R_skew
+
+; Clamp to valid range [12.5ms, buffer max]
+kTarget_A_L max kTarget_A_L, 0.0125
+kTarget_A_L min kTarget_A_L, k(iMaxDelayTime)
+kTarget_A_R max kTarget_A_R, 0.0125
+kTarget_A_R min kTarget_A_R, k(iMaxDelayTime)
+kTarget_B_L max kTarget_B_L, 0.0125
+kTarget_B_L min kTarget_B_L, k(iMaxDelayTime)
+kTarget_B_R max kTarget_B_R, 0.0125
+kTarget_B_R min kTarget_B_R, k(iMaxDelayTime)
+kTarget_C_L max kTarget_C_L, 0.0125
+kTarget_C_L min kTarget_C_L, k(iMaxDelayTime)
+kTarget_C_R max kTarget_C_R, 0.0125
+kTarget_C_R min kTarget_C_R, k(iMaxDelayTime)
+kTarget_D_L max kTarget_D_L, 0.0125
+kTarget_D_L min kTarget_D_L, k(iMaxDelayTime)
+kTarget_D_R max kTarget_D_R, 0.0125
+kTarget_D_R min kTarget_D_R, k(iMaxDelayTime)
+
+
+; ------------------------------------------------------------
+; Analog Tracking Law (latched retime ratio)
+; On a target change, latch a fixed playback-rate ratio:
+;   kRate = old_delay / new_delay
+; Then move the effective delay at that fixed rate until the
+; new target is reached, which is closer to tape/BBD retiming
+; than the previous continuously bending first-order chase.
+; ------------------------------------------------------------
+
+kTargetTol = (1 / sr)
+
+kLastTarget_A_L, kRate_A_L, kD_A_L AnalogTrack kTarget_A_L, kLastTarget_A_L, kRate_A_L, kD_A_L, kTargetTol
+kLastTarget_A_R, kRate_A_R, kD_A_R AnalogTrack kTarget_A_R, kLastTarget_A_R, kRate_A_R, kD_A_R, kTargetTol
+kLastTarget_B_L, kRate_B_L, kD_B_L AnalogTrack kTarget_B_L, kLastTarget_B_L, kRate_B_L, kD_B_L, kTargetTol
+kLastTarget_B_R, kRate_B_R, kD_B_R AnalogTrack kTarget_B_R, kLastTarget_B_R, kRate_B_R, kD_B_R, kTargetTol
+kLastTarget_C_L, kRate_C_L, kD_C_L AnalogTrack kTarget_C_L, kLastTarget_C_L, kRate_C_L, kD_C_L, kTargetTol
+kLastTarget_C_R, kRate_C_R, kD_C_R AnalogTrack kTarget_C_R, kLastTarget_C_R, kRate_C_R, kD_C_R, kTargetTol
+kLastTarget_D_L, kRate_D_L, kD_D_L AnalogTrack kTarget_D_L, kLastTarget_D_L, kRate_D_L, kD_D_L, kTargetTol
+kLastTarget_D_R, kRate_D_R, kD_D_R AnalogTrack kTarget_D_R, kLastTarget_D_R, kRate_D_R, kD_D_R, kTargetTol
+
+; Clamp tracked values to buffer bounds
+kD_A_L max kD_A_L, 0.00001
+kD_A_L min kD_A_L, k(iMaxDelayTime)
+kD_A_R max kD_A_R, 0.00001
+kD_A_R min kD_A_R, k(iMaxDelayTime)
+kD_B_L max kD_B_L, 0.00001
+kD_B_L min kD_B_L, k(iMaxDelayTime)
+kD_B_R max kD_B_R, 0.00001
+kD_B_R min kD_B_R, k(iMaxDelayTime)
+kD_C_L max kD_C_L, 0.00001
+kD_C_L min kD_C_L, k(iMaxDelayTime)
+kD_C_R max kD_C_R, 0.00001
+kD_C_R min kD_C_R, k(iMaxDelayTime)
+kD_D_L max kD_D_L, 0.00001
+kD_D_L min kD_D_L, k(iMaxDelayTime)
+kD_D_R max kD_D_R, 0.00001
+kD_D_R min kD_D_R, k(iMaxDelayTime)
+
+; k→a smoothing fallback: portk is hardware-confirmed
+kD_A_L_s portk kD_A_L, 0.005
+kD_A_R_s portk kD_A_R, 0.005
+kD_B_L_s portk kD_B_L, 0.005
+kD_B_R_s portk kD_B_R, 0.005
+kD_C_L_s portk kD_C_L, 0.005
+kD_C_R_s portk kD_C_R, 0.005
+kD_D_L_s portk kD_D_L, 0.005
+kD_D_R_s portk kD_D_R, 0.005
+aD_A_L = a(kD_A_L_s)
+aD_A_R = a(kD_A_R_s)
+aD_B_L = a(kD_B_L_s)
+aD_B_R = a(kD_B_R_s)
+aD_C_L = a(kD_C_L_s)
+aD_C_R = a(kD_C_R_s)
+aD_D_L = a(kD_D_L_s)
+aD_D_R = a(kD_D_R_s)
+
+; Digital mode: crossfade read heads instead of retiming
+kDigStep = 1 / (0.02 * kr)
+
+kDigRead_A_L, kDigOld_A_L, kDigNew_A_L, kDigQueued_A_L, kDigQueue_A_L, kDigX_A_L DigXfade kTarget_A_L, kDigRead_A_L, kDigOld_A_L, kDigNew_A_L, kDigQueued_A_L, kDigQueue_A_L, kDigX_A_L, kTargetTol, kDigStep
+kDigRead_A_R, kDigOld_A_R, kDigNew_A_R, kDigQueued_A_R, kDigQueue_A_R, kDigX_A_R DigXfade kTarget_A_R, kDigRead_A_R, kDigOld_A_R, kDigNew_A_R, kDigQueued_A_R, kDigQueue_A_R, kDigX_A_R, kTargetTol, kDigStep
+kDigRead_B_L, kDigOld_B_L, kDigNew_B_L, kDigQueued_B_L, kDigQueue_B_L, kDigX_B_L DigXfade kTarget_B_L, kDigRead_B_L, kDigOld_B_L, kDigNew_B_L, kDigQueued_B_L, kDigQueue_B_L, kDigX_B_L, kTargetTol, kDigStep
+kDigRead_B_R, kDigOld_B_R, kDigNew_B_R, kDigQueued_B_R, kDigQueue_B_R, kDigX_B_R DigXfade kTarget_B_R, kDigRead_B_R, kDigOld_B_R, kDigNew_B_R, kDigQueued_B_R, kDigQueue_B_R, kDigX_B_R, kTargetTol, kDigStep
+kDigRead_C_L, kDigOld_C_L, kDigNew_C_L, kDigQueued_C_L, kDigQueue_C_L, kDigX_C_L DigXfade kTarget_C_L, kDigRead_C_L, kDigOld_C_L, kDigNew_C_L, kDigQueued_C_L, kDigQueue_C_L, kDigX_C_L, kTargetTol, kDigStep
+kDigRead_C_R, kDigOld_C_R, kDigNew_C_R, kDigQueued_C_R, kDigQueue_C_R, kDigX_C_R DigXfade kTarget_C_R, kDigRead_C_R, kDigOld_C_R, kDigNew_C_R, kDigQueued_C_R, kDigQueue_C_R, kDigX_C_R, kTargetTol, kDigStep
+kDigRead_D_L, kDigOld_D_L, kDigNew_D_L, kDigQueued_D_L, kDigQueue_D_L, kDigX_D_L DigXfade kTarget_D_L, kDigRead_D_L, kDigOld_D_L, kDigNew_D_L, kDigQueued_D_L, kDigQueue_D_L, kDigX_D_L, kTargetTol, kDigStep
+kDigRead_D_R, kDigOld_D_R, kDigNew_D_R, kDigQueued_D_R, kDigQueue_D_R, kDigX_D_R DigXfade kTarget_D_R, kDigRead_D_R, kDigOld_D_R, kDigNew_D_R, kDigQueued_D_R, kDigQueue_D_R, kDigX_D_R, kTargetTol, kDigStep
+
+aDigOld_A_L = a(kDigOld_A_L)
+aDigOld_A_R = a(kDigOld_A_R)
+aDigOld_B_L = a(kDigOld_B_L)
+aDigOld_B_R = a(kDigOld_B_R)
+aDigOld_C_L = a(kDigOld_C_L)
+aDigOld_C_R = a(kDigOld_C_R)
+aDigOld_D_L = a(kDigOld_D_L)
+aDigOld_D_R = a(kDigOld_D_R)
+aDigNew_A_L = a(kDigNew_A_L)
+aDigNew_A_R = a(kDigNew_A_R)
+aDigNew_B_L = a(kDigNew_B_L)
+aDigNew_B_R = a(kDigNew_B_R)
+aDigNew_C_L = a(kDigNew_C_L)
+aDigNew_C_R = a(kDigNew_C_R)
+aDigNew_D_L = a(kDigNew_D_L)
+aDigNew_D_R = a(kDigNew_D_R)
+aDigXP_A_L = a(kDigX_A_L)
+aDigXP_A_R = a(kDigX_A_R)
+aDigXP_B_L = a(kDigX_B_L)
+aDigXP_B_R = a(kDigX_B_R)
+aDigXP_C_L = a(kDigX_C_L)
+aDigXP_C_R = a(kDigX_C_R)
+aDigXP_D_L = a(kDigX_D_L)
+aDigXP_D_R = a(kDigX_D_R)
+aDigOldGain_A_L = cos(aDigXP_A_L * ($M_PI_2))
+aDigOldGain_A_R = cos(aDigXP_A_R * ($M_PI_2))
+aDigOldGain_B_L = cos(aDigXP_B_L * ($M_PI_2))
+aDigOldGain_B_R = cos(aDigXP_B_R * ($M_PI_2))
+aDigOldGain_C_L = cos(aDigXP_C_L * ($M_PI_2))
+aDigOldGain_C_R = cos(aDigXP_C_R * ($M_PI_2))
+aDigOldGain_D_L = cos(aDigXP_D_L * ($M_PI_2))
+aDigOldGain_D_R = cos(aDigXP_D_R * ($M_PI_2))
+aDigNewGain_A_L = sin(aDigXP_A_L * ($M_PI_2))
+aDigNewGain_A_R = sin(aDigXP_A_R * ($M_PI_2))
+aDigNewGain_B_L = sin(aDigXP_B_L * ($M_PI_2))
+aDigNewGain_B_R = sin(aDigXP_B_R * ($M_PI_2))
+aDigNewGain_C_L = sin(aDigXP_C_L * ($M_PI_2))
+aDigNewGain_C_R = sin(aDigXP_C_R * ($M_PI_2))
+aDigNewGain_D_L = sin(aDigXP_D_L * ($M_PI_2))
+aDigNewGain_D_R = sin(aDigXP_D_R * ($M_PI_2))
+
+if ((gkHold == 1) && (kHoldPrev == 0)) then
+  kHoldMode_A = kDigital_A
+  kHoldMode_B = kDigital_B
+  kHoldMode_C = kDigital_C
+  kHoldMode_D = kDigital_D
+  kHoldTarget_A_L = kTarget_A_L
+  kHoldTarget_A_R = kTarget_A_R
+  kHoldTarget_B_L = kTarget_B_L
+  kHoldTarget_B_R = kTarget_B_R
+  kHoldTarget_C_L = kTarget_C_L
+  kHoldTarget_C_R = kTarget_C_R
+  kHoldTarget_D_L = kTarget_D_L
+  kHoldTarget_D_R = kTarget_D_R
+
+  kHoldAnalog_A_L = kD_A_L
+  kHoldAnalog_A_R = kD_A_R
+  kHoldAnalog_B_L = kD_B_L
+  kHoldAnalog_B_R = kD_B_R
+  kHoldAnalog_C_L = kD_C_L
+  kHoldAnalog_C_R = kD_C_R
+  kHoldAnalog_D_L = kD_D_L
+  kHoldAnalog_D_R = kD_D_R
+
+  kHoldDigital_A_L = kDigRead_A_L
+  kHoldDigital_A_R = kDigRead_A_R
+  kHoldDigital_B_L = kDigRead_B_L
+  kHoldDigital_B_R = kDigRead_B_R
+  kHoldDigital_C_L = kDigRead_C_L
+  kHoldDigital_C_R = kDigRead_C_R
+  kHoldDigital_D_L = kDigRead_D_L
+  kHoldDigital_D_R = kDigRead_D_R
+endif
+kHoldPrev = gkHold
+
+if (gkHold == 1) then
+  kD_A_L, kRate_A_L, kLastTarget_A_L, kDigRead_A_L, kDigOld_A_L, kDigNew_A_L, kDigQueue_A_L, kDigX_A_L HoldRestore kTarget_A_L, kHoldTarget_A_L, kHoldAnalog_A_L, kHoldDigital_A_L, kTargetTol, kD_A_L, kRate_A_L, kLastTarget_A_L, kDigRead_A_L, kDigOld_A_L, kDigNew_A_L, kDigQueue_A_L, kDigX_A_L
+  kD_A_R, kRate_A_R, kLastTarget_A_R, kDigRead_A_R, kDigOld_A_R, kDigNew_A_R, kDigQueue_A_R, kDigX_A_R HoldRestore kTarget_A_R, kHoldTarget_A_R, kHoldAnalog_A_R, kHoldDigital_A_R, kTargetTol, kD_A_R, kRate_A_R, kLastTarget_A_R, kDigRead_A_R, kDigOld_A_R, kDigNew_A_R, kDigQueue_A_R, kDigX_A_R
+  kD_B_L, kRate_B_L, kLastTarget_B_L, kDigRead_B_L, kDigOld_B_L, kDigNew_B_L, kDigQueue_B_L, kDigX_B_L HoldRestore kTarget_B_L, kHoldTarget_B_L, kHoldAnalog_B_L, kHoldDigital_B_L, kTargetTol, kD_B_L, kRate_B_L, kLastTarget_B_L, kDigRead_B_L, kDigOld_B_L, kDigNew_B_L, kDigQueue_B_L, kDigX_B_L
+  kD_B_R, kRate_B_R, kLastTarget_B_R, kDigRead_B_R, kDigOld_B_R, kDigNew_B_R, kDigQueue_B_R, kDigX_B_R HoldRestore kTarget_B_R, kHoldTarget_B_R, kHoldAnalog_B_R, kHoldDigital_B_R, kTargetTol, kD_B_R, kRate_B_R, kLastTarget_B_R, kDigRead_B_R, kDigOld_B_R, kDigNew_B_R, kDigQueue_B_R, kDigX_B_R
+  kD_C_L, kRate_C_L, kLastTarget_C_L, kDigRead_C_L, kDigOld_C_L, kDigNew_C_L, kDigQueue_C_L, kDigX_C_L HoldRestore kTarget_C_L, kHoldTarget_C_L, kHoldAnalog_C_L, kHoldDigital_C_L, kTargetTol, kD_C_L, kRate_C_L, kLastTarget_C_L, kDigRead_C_L, kDigOld_C_L, kDigNew_C_L, kDigQueue_C_L, kDigX_C_L
+  kD_C_R, kRate_C_R, kLastTarget_C_R, kDigRead_C_R, kDigOld_C_R, kDigNew_C_R, kDigQueue_C_R, kDigX_C_R HoldRestore kTarget_C_R, kHoldTarget_C_R, kHoldAnalog_C_R, kHoldDigital_C_R, kTargetTol, kD_C_R, kRate_C_R, kLastTarget_C_R, kDigRead_C_R, kDigOld_C_R, kDigNew_C_R, kDigQueue_C_R, kDigX_C_R
+  kD_D_L, kRate_D_L, kLastTarget_D_L, kDigRead_D_L, kDigOld_D_L, kDigNew_D_L, kDigQueue_D_L, kDigX_D_L HoldRestore kTarget_D_L, kHoldTarget_D_L, kHoldAnalog_D_L, kHoldDigital_D_L, kTargetTol, kD_D_L, kRate_D_L, kLastTarget_D_L, kDigRead_D_L, kDigOld_D_L, kDigNew_D_L, kDigQueue_D_L, kDigX_D_L
+  kD_D_R, kRate_D_R, kLastTarget_D_R, kDigRead_D_R, kDigOld_D_R, kDigNew_D_R, kDigQueue_D_R, kDigX_D_R HoldRestore kTarget_D_R, kHoldTarget_D_R, kHoldAnalog_D_R, kHoldDigital_D_R, kTargetTol, kD_D_R, kRate_D_R, kLastTarget_D_R, kDigRead_D_R, kDigOld_D_R, kDigNew_D_R, kDigQueue_D_R, kDigX_D_R
+endif
+
+
+; ------------------------------------------------------------
+; Feedback and Mix Smoothing
+; ------------------------------------------------------------
+
+; NEWLY ADDED: mars_affects-style short-delay feedback compensation.
+; Base knob ceiling is reduced so long delays decay faster; short delays
+; recover some sustain from the time-dependent boost. Final clamp stays 0.95.
+kFbk_A_raw = (gkFeedbackA_knob * 0.80) + ((1 - gkMasterTimeKnob) * 0.15)
+kFbk_B_raw = (gkFeedbackB_knob * 0.80) + ((1 - kRatio_B_knob_clamped) * 0.15)
+kFbk_C_raw = (gkFeedbackC_knob * 0.80) + ((1 - kRatio_C_knob_clamped) * 0.15)
+kFbk_D_raw = (gkFeedbackD_knob * 0.80) + ((1 - kRatio_D_knob_clamped) * 0.15)
+
+kFbk_A_raw limit kFbk_A_raw, 0, 0.95
+kFbk_B_raw limit kFbk_B_raw, 0, 0.95
+kFbk_C_raw limit kFbk_C_raw, 0, 0.95
+kFbk_D_raw limit kFbk_D_raw, 0, 0.95
+
+kFbk_A portk kFbk_A_raw, 0.1
+kFbk_B portk kFbk_B_raw, 0.1
+kFbk_C portk kFbk_C_raw, 0.1
+kFbk_D portk kFbk_D_raw, 0.1
+
+kMix_A portk gkMix_A_knob, 0.1
+kMix_B portk gkMix_B_knob, 0.1
+kMix_C portk gkMix_C_knob, 0.1
+kMix_D portk gkMix_D_knob, 0.1
+
+
+; ------------------------------------------------------------
+; 4 Stacked Stereo Delay Lines
+; ------------------------------------------------------------
+
+; --- Stage A ---
+aStageA_inL = aInputL
+aStageA_inR = aInputR
+
+aBufA_L  delayr iMaxDelayTime + 0.1
+aTapA_L  deltap3 aD_A_L
+aTapA_L_old deltap3 aDigOld_A_L
+aTapA_L_new deltap3 aDigNew_A_L
+aBufA_R  delayr iMaxDelayTime + 0.1
+aTapA_R  deltap3 aD_A_R
+aTapA_R_old deltap3 aDigOld_A_R
+aTapA_R_new deltap3 aDigNew_A_R
+aTapA_L_dig = (aTapA_L_old * aDigOldGain_A_L) + (aTapA_L_new * aDigNewGain_A_L)
+aTapA_R_dig = (aTapA_R_old * aDigOldGain_A_R) + (aTapA_R_new * aDigNewGain_A_R)
+aTapA_L_sel = ((1 - kDigital_A) * aTapA_L) + (kDigital_A * aTapA_L_dig)
+aTapA_R_sel = ((1 - kDigital_A) * aTapA_R) + (kDigital_A * aTapA_R_dig)
+aTapA_L_hold_analog deltap3 a(kHoldAnalog_A_L)
+aTapA_R_hold_analog deltap3 a(kHoldAnalog_A_R)
+aTapA_L_hold_digital deltap3 a(kHoldDigital_A_L)
+aTapA_R_hold_digital deltap3 a(kHoldDigital_A_R)
+aTapA_L_hold = ((1 - kHoldMode_A) * aTapA_L_hold_analog) + (kHoldMode_A * aTapA_L_hold_digital)
+aTapA_R_hold = ((1 - kHoldMode_A) * aTapA_R_hold_analog) + (kHoldMode_A * aTapA_R_hold_digital)
+
+aMixA_L = (aStageA_inL * a(1 - kMix_A)) + (aTapA_L_sel * a(kMix_A))
+aMixA_R = (aStageA_inR * a(1 - kMix_A)) + (aTapA_R_sel * a(kMix_A))
+
+; --- Stage B ---
+aStageB_inL = aMixA_L
+aStageB_inR = aMixA_R
+
+aBufB_L  delayr iMaxDelayTime + 0.1
+aTapB_L  deltap3 aD_B_L
+aTapB_L_old deltap3 aDigOld_B_L
+aTapB_L_new deltap3 aDigNew_B_L
+aBufB_R  delayr iMaxDelayTime + 0.1
+aTapB_R  deltap3 aD_B_R
+aTapB_R_old deltap3 aDigOld_B_R
+aTapB_R_new deltap3 aDigNew_B_R
+aTapB_L_dig = (aTapB_L_old * aDigOldGain_B_L) + (aTapB_L_new * aDigNewGain_B_L)
+aTapB_R_dig = (aTapB_R_old * aDigOldGain_B_R) + (aTapB_R_new * aDigNewGain_B_R)
+aTapB_L_sel = ((1 - kDigital_B) * aTapB_L) + (kDigital_B * aTapB_L_dig)
+aTapB_R_sel = ((1 - kDigital_B) * aTapB_R) + (kDigital_B * aTapB_R_dig)
+aTapB_L_hold_analog deltap3 a(kHoldAnalog_B_L)
+aTapB_R_hold_analog deltap3 a(kHoldAnalog_B_R)
+aTapB_L_hold_digital deltap3 a(kHoldDigital_B_L)
+aTapB_R_hold_digital deltap3 a(kHoldDigital_B_R)
+aTapB_L_hold = ((1 - kHoldMode_B) * aTapB_L_hold_analog) + (kHoldMode_B * aTapB_L_hold_digital)
+aTapB_R_hold = ((1 - kHoldMode_B) * aTapB_R_hold_analog) + (kHoldMode_B * aTapB_R_hold_digital)
+
+kMixB_Dry = max(1 - (2 * kMix_B), 0)
+kMixB_Prev = max(1 - abs((2 * kMix_B) - 1), 0)
+kMixB_Wet = max((2 * kMix_B) - 1, 0)
+aMixB_L = (aInputL * a(kMixB_Dry)) + (aStageB_inL * a(kMixB_Prev)) + (aTapB_L_sel * a(kMixB_Wet))
+aMixB_R = (aInputR * a(kMixB_Dry)) + (aStageB_inR * a(kMixB_Prev)) + (aTapB_R_sel * a(kMixB_Wet))
+
+; --- Stage C ---
+aStageC_inL = aMixB_L
+aStageC_inR = aMixB_R
+
+aBufC_L  delayr iMaxDelayTime + 0.1
+aTapC_L  deltap3 aD_C_L
+aTapC_L_old deltap3 aDigOld_C_L
+aTapC_L_new deltap3 aDigNew_C_L
+aBufC_R  delayr iMaxDelayTime + 0.1
+aTapC_R  deltap3 aD_C_R
+aTapC_R_old deltap3 aDigOld_C_R
+aTapC_R_new deltap3 aDigNew_C_R
+aTapC_L_dig = (aTapC_L_old * aDigOldGain_C_L) + (aTapC_L_new * aDigNewGain_C_L)
+aTapC_R_dig = (aTapC_R_old * aDigOldGain_C_R) + (aTapC_R_new * aDigNewGain_C_R)
+aTapC_L_sel = ((1 - kDigital_C) * aTapC_L) + (kDigital_C * aTapC_L_dig)
+aTapC_R_sel = ((1 - kDigital_C) * aTapC_R) + (kDigital_C * aTapC_R_dig)
+aTapC_L_hold_analog deltap3 a(kHoldAnalog_C_L)
+aTapC_R_hold_analog deltap3 a(kHoldAnalog_C_R)
+aTapC_L_hold_digital deltap3 a(kHoldDigital_C_L)
+aTapC_R_hold_digital deltap3 a(kHoldDigital_C_R)
+aTapC_L_hold = ((1 - kHoldMode_C) * aTapC_L_hold_analog) + (kHoldMode_C * aTapC_L_hold_digital)
+aTapC_R_hold = ((1 - kHoldMode_C) * aTapC_R_hold_analog) + (kHoldMode_C * aTapC_R_hold_digital)
+
+kMixC_Dry = max(1 - (2 * kMix_C), 0)
+kMixC_Prev = max(1 - abs((2 * kMix_C) - 1), 0)
+kMixC_Wet = max((2 * kMix_C) - 1, 0)
+aMixC_L = (aInputL * a(kMixC_Dry)) + (aStageC_inL * a(kMixC_Prev)) + (aTapC_L_sel * a(kMixC_Wet))
+aMixC_R = (aInputR * a(kMixC_Dry)) + (aStageC_inR * a(kMixC_Prev)) + (aTapC_R_sel * a(kMixC_Wet))
+
+; --- Stage D ---
+aStageD_inL = aMixC_L
+aStageD_inR = aMixC_R
+
+aBufD_L  delayr iMaxDelayTime + 0.1
+aTapD_L  deltap3 aD_D_L
+aTapD_L_old deltap3 aDigOld_D_L
+aTapD_L_new deltap3 aDigNew_D_L
+aBufD_R  delayr iMaxDelayTime + 0.1
+aTapD_R  deltap3 aD_D_R
+aTapD_R_old deltap3 aDigOld_D_R
+aTapD_R_new deltap3 aDigNew_D_R
+aTapD_L_dig = (aTapD_L_old * aDigOldGain_D_L) + (aTapD_L_new * aDigNewGain_D_L)
+aTapD_R_dig = (aTapD_R_old * aDigOldGain_D_R) + (aTapD_R_new * aDigNewGain_D_R)
+aTapD_L_sel = ((1 - kDigital_D) * aTapD_L) + (kDigital_D * aTapD_L_dig)
+aTapD_R_sel = ((1 - kDigital_D) * aTapD_R) + (kDigital_D * aTapD_R_dig)
+aTapD_L_hold_analog deltap3 a(kHoldAnalog_D_L)
+aTapD_R_hold_analog deltap3 a(kHoldAnalog_D_R)
+aTapD_L_hold_digital deltap3 a(kHoldDigital_D_L)
+aTapD_R_hold_digital deltap3 a(kHoldDigital_D_R)
+aTapD_L_hold = ((1 - kHoldMode_D) * aTapD_L_hold_analog) + (kHoldMode_D * aTapD_L_hold_digital)
+aTapD_R_hold = ((1 - kHoldMode_D) * aTapD_R_hold_analog) + (kHoldMode_D * aTapD_R_hold_digital)
+
+kMixD_Dry = max(1 - (2 * kMix_D), 0)
+kMixD_Prev = max(1 - abs((2 * kMix_D) - 1), 0)
+kMixD_Wet = max((2 * kMix_D) - 1, 0)
+aMixD_L = (aInputL * a(kMixD_Dry)) + (aStageD_inL * a(kMixD_Prev)) + (aTapD_L_sel * a(kMixD_Wet))
+aMixD_R = (aInputR * a(kMixD_Dry)) + (aStageD_inR * a(kMixD_Prev)) + (aTapD_R_sel * a(kMixD_Wet))
+
+; record cascade feedback matrix per side
+; 0: 5  = A->A, B->B, C->C, D->D
+; 1: 1A = D->A
+; 2: 1B = D->A, D->C, D->D, C->C, C->A, B->B, B->A, A->A
+; 3: 2A = C->A, D->D
+; 4: 2B = A->A, B->B, B->A, C->A, C->C, D->D
+; 5: 3A = B->A, D->C
+; 6: 3B = A->A, B->B, B->A, D->C
+; 7: 3C = A->A, B->B, B->A, C->C, D->D, D->C
+; 8: 4A = B->A, C->C, D->D
+; 9: 4B = A->A, B->B, B->A, C->C, D->D
+if (kCascadeMode == 0) then
+  kFbNorm_A = 1
+  kFbNorm_B = 1
+  kFbNorm_C = 1
+  kFbNorm_D = 1
+  aFb_A_L_base = aTapA_L_sel
+  aFb_A_R_base = aTapA_R_sel
+  aFb_B_L_base = aTapB_L_sel
+  aFb_B_R_base = aTapB_R_sel
+  aFb_C_L_base = aTapC_L_sel
+  aFb_C_R_base = aTapC_R_sel
+  aFb_D_L_base = aTapD_L_sel
+  aFb_D_R_base = aTapD_R_sel
+elseif (kCascadeMode == 1) then
+  kFbNorm_A = 1
+  kFbNorm_B = 1
+  kFbNorm_C = 1
+  kFbNorm_D = 1
+  aFb_A_L_base = aTapD_L_sel
+  aFb_A_R_base = aTapD_R_sel
+  aFb_B_L_base = 0
+  aFb_B_R_base = 0
+  aFb_C_L_base = 0
+  aFb_C_R_base = 0
+  aFb_D_L_base = 0
+  aFb_D_R_base = 0
+elseif (kCascadeMode == 2) then
+  kFbNorm_A = 4
+  kFbNorm_B = 1
+  kFbNorm_C = 2
+  kFbNorm_D = 1
+  aFb_A_L_base = aTapA_L_sel + aTapB_L_sel + aTapC_L_sel + aTapD_L_sel
+  aFb_A_R_base = aTapA_R_sel + aTapB_R_sel + aTapC_R_sel + aTapD_R_sel
+  aFb_B_L_base = aTapB_L_sel
+  aFb_B_R_base = aTapB_R_sel
+  aFb_C_L_base = aTapC_L_sel + aTapD_L_sel
+  aFb_C_R_base = aTapC_R_sel + aTapD_R_sel
+  aFb_D_L_base = aTapD_L_sel
+  aFb_D_R_base = aTapD_R_sel
+elseif (kCascadeMode == 3) then
+  kFbNorm_A = 1
+  kFbNorm_B = 1
+  kFbNorm_C = 1
+  kFbNorm_D = 1
+  aFb_A_L_base = aTapC_L_sel
+  aFb_A_R_base = aTapC_R_sel
+  aFb_B_L_base = 0
+  aFb_B_R_base = 0
+  aFb_C_L_base = 0
+  aFb_C_R_base = 0
+  aFb_D_L_base = aTapD_L_sel
+  aFb_D_R_base = aTapD_R_sel
+elseif (kCascadeMode == 4) then
+  kFbNorm_A = 3
+  kFbNorm_B = 1
+  kFbNorm_C = 1
+  kFbNorm_D = 1
+  aFb_A_L_base = aTapA_L_sel + aTapB_L_sel + aTapC_L_sel
+  aFb_A_R_base = aTapA_R_sel + aTapB_R_sel + aTapC_R_sel
+  aFb_B_L_base = aTapB_L_sel
+  aFb_B_R_base = aTapB_R_sel
+  aFb_C_L_base = aTapC_L_sel
+  aFb_C_R_base = aTapC_R_sel
+  aFb_D_L_base = aTapD_L_sel
+  aFb_D_R_base = aTapD_R_sel
+elseif (kCascadeMode == 5) then
+  kFbNorm_A = 1
+  kFbNorm_B = 1
+  kFbNorm_C = 1
+  kFbNorm_D = 1
+  aFb_A_L_base = aTapB_L_sel
+  aFb_A_R_base = aTapB_R_sel
+  aFb_B_L_base = 0
+  aFb_B_R_base = 0
+  aFb_C_L_base = aTapD_L_sel
+  aFb_C_R_base = aTapD_R_sel
+  aFb_D_L_base = 0
+  aFb_D_R_base = 0
+elseif (kCascadeMode == 6) then
+  kFbNorm_A = 2
+  kFbNorm_B = 1
+  kFbNorm_C = 1
+  kFbNorm_D = 1
+  aFb_A_L_base = aTapA_L_sel + aTapB_L_sel
+  aFb_A_R_base = aTapA_R_sel + aTapB_R_sel
+  aFb_B_L_base = aTapB_L_sel
+  aFb_B_R_base = aTapB_R_sel
+  aFb_C_L_base = aTapD_L_sel
+  aFb_C_R_base = aTapD_R_sel
+  aFb_D_L_base = 0
+  aFb_D_R_base = 0
+elseif (kCascadeMode == 7) then
+  kFbNorm_A = 2
+  kFbNorm_B = 1
+  kFbNorm_C = 2
+  kFbNorm_D = 1
+  aFb_A_L_base = aTapA_L_sel + aTapB_L_sel
+  aFb_A_R_base = aTapA_R_sel + aTapB_R_sel
+  aFb_B_L_base = aTapB_L_sel
+  aFb_B_R_base = aTapB_R_sel
+  aFb_C_L_base = aTapC_L_sel + aTapD_L_sel
+  aFb_C_R_base = aTapC_R_sel + aTapD_R_sel
+  aFb_D_L_base = aTapD_L_sel
+  aFb_D_R_base = aTapD_R_sel
+elseif (kCascadeMode == 8) then
+  kFbNorm_A = 1
+  kFbNorm_B = 1
+  kFbNorm_C = 1
+  kFbNorm_D = 1
+  aFb_A_L_base = aTapB_L_sel
+  aFb_A_R_base = aTapB_R_sel
+  aFb_B_L_base = 0
+  aFb_B_R_base = 0
+  aFb_C_L_base = aTapC_L_sel
+  aFb_C_R_base = aTapC_R_sel
+  aFb_D_L_base = aTapD_L_sel
+  aFb_D_R_base = aTapD_R_sel
+else
+  kFbNorm_A = 2
+  kFbNorm_B = 1
+  kFbNorm_C = 1
+  kFbNorm_D = 1
+  aFb_A_L_base = aTapA_L_sel + aTapB_L_sel
+  aFb_A_R_base = aTapA_R_sel + aTapB_R_sel
+  aFb_B_L_base = aTapB_L_sel
+  aFb_B_R_base = aTapB_R_sel
+  aFb_C_L_base = aTapC_L_sel
+  aFb_C_R_base = aTapC_R_sel
+  aFb_D_L_base = aTapD_L_sel
+  aFb_D_R_base = aTapD_R_sel
+endif
+
+; size_alt same-stage L/R crossfeed ladder on top of cascade matrix
+; 0: none
+; 1: D only
+; 2: C + D
+; 3: B + C + D
+; 4: A + B + C + D
+aFb_A_L = aFb_A_L_base
+aFb_A_R = aFb_A_R_base
+aFb_B_L = aFb_B_L_base
+aFb_B_R = aFb_B_R_base
+aFb_C_L = aFb_C_L_base
+aFb_C_R = aFb_C_R_base
+aFb_D_L = aFb_D_L_base
+aFb_D_R = aFb_D_R_base
+
+if (kFbRouteState >= 1) then
+  aFb_D_L = aFb_D_R_base
+  aFb_D_R = aFb_D_L_base
+endif
+if (kFbRouteState >= 2) then
+  aFb_C_L = aFb_C_R_base
+  aFb_C_R = aFb_C_L_base
+endif
+if (kFbRouteState >= 3) then
+  aFb_B_L = aFb_B_R_base
+  aFb_B_R = aFb_B_L_base
+endif
+if (kFbRouteState >= 4) then
+  aFb_A_L = aFb_A_R_base
+  aFb_A_R = aFb_A_L_base
+endif
+
+aFb_A_L = aFb_A_L / a(kFbNorm_A)
+aFb_A_R = aFb_A_R / a(kFbNorm_A)
+aFb_B_L = aFb_B_L / a(kFbNorm_B)
+aFb_B_R = aFb_B_R / a(kFbNorm_B)
+aFb_C_L = aFb_C_L / a(kFbNorm_C)
+aFb_C_R = aFb_C_R / a(kFbNorm_C)
+aFb_D_L = aFb_D_L / a(kFbNorm_D)
+aFb_D_R = aFb_D_R / a(kFbNorm_D)
+
+delayw ((1 - kPurgeActive) * (((1 - kHoldActive) * (aStageA_inL + (aFb_A_L * a(kFbk_A) * a(kOutputDelayDamping)))) + (kHoldActive * aTapA_L_hold)))
+delayw ((1 - kPurgeActive) * (((1 - kHoldActive) * (aStageA_inR + (aFb_A_R * a(kFbk_A) * a(kOutputDelayDamping)))) + (kHoldActive * aTapA_R_hold)))
+delayw ((1 - kPurgeActive) * (((1 - kHoldActive) * (aStageB_inL + (aFb_B_L * a(kFbk_B) * a(kOutputDelayDamping)))) + (kHoldActive * aTapB_L_hold)))
+delayw ((1 - kPurgeActive) * (((1 - kHoldActive) * (aStageB_inR + (aFb_B_R * a(kFbk_B) * a(kOutputDelayDamping)))) + (kHoldActive * aTapB_R_hold)))
+delayw ((1 - kPurgeActive) * (((1 - kHoldActive) * (aStageC_inL + (aFb_C_L * a(kFbk_C) * a(kOutputDelayDamping)))) + (kHoldActive * aTapC_L_hold)))
+delayw ((1 - kPurgeActive) * (((1 - kHoldActive) * (aStageC_inR + (aFb_C_R * a(kFbk_C) * a(kOutputDelayDamping)))) + (kHoldActive * aTapC_R_hold)))
+delayw ((1 - kPurgeActive) * (((1 - kHoldActive) * (aStageD_inL + (aFb_D_L * a(kFbk_D) * a(kOutputDelayDamping)))) + (kHoldActive * aTapD_L_hold)))
+delayw ((1 - kPurgeActive) * (((1 - kHoldActive) * (aStageD_inR + (aFb_D_R * a(kFbk_D) * a(kOutputDelayDamping)))) + (kHoldActive * aTapD_R_hold)))
+
+
+; ------------------------------------------------------------
+; Final Dry/Wet Blend
+; ------------------------------------------------------------
+
+kBlend portk gkBlend_knob, 0.1
+
+aOutputL = (aInputL * a(1 - kBlend)) + (aMixD_L * a(kBlend))
+aOutputR = (aInputR * a(1 - kBlend)) + (aMixD_R * a(kBlend))
+
+kWetWindow = sin(min(kModeXfade, min(kTopologyXfade, kFbRouteXfade)) * $M_PI_2)
+aOutputL = (aInputL * a(1 - kWetWindow)) + (aOutputL * a(kWetWindow))
+aOutputR = (aInputR * a(1 - kWetWindow)) + (aOutputR * a(kWetWindow))
+
+
+; ------------------------------------------------------------
+; Detect Clipping / Adjust Damping (mars_affects pattern)
+; ------------------------------------------------------------
+
+kOutputDelayDamping = kOutputDelayDamping + 0.0005
+
+kMax max k(abs(aOutputL)), k(abs(aOutputR))
+
+if (kMax > 0.90) then
+  kOutputDelayDamping = kOutputDelayDamping - 0.2
+endif
+
+kOutputDelayDamping min kOutputDelayDamping, 1
+kOutputDelayDamping max kOutputDelayDamping, 0.4
+
+
+; ------------------------------------------------------------
+; Output Protection (HARD_RULES: Law of the Final Saturator)
+; ------------------------------------------------------------
+
+denorm aOutputL, aOutputR
+aOutputL clip aOutputL, 0, 1
+aOutputR clip aOutputR, 0, 1
+
+outs aOutputL, aOutputR
+
+
+; ------------------------------------------------------------
+; Clock Pulse Out
+; ------------------------------------------------------------
+
+kPulseTime_ms = (kPulseTime_ms > 0 ? kPulseTime_ms - (1000/kr) : 0)
+kPulseTime_ms max 0, kPulseTime_ms
+
+if (gkClock_tick == 1) then
+  if (kPulseTime_ms == 0) then
+    kPulseTime_ms = 20
+  endif
+  gkClock_tick = 0
+endif
+
+gkeol    = kPulseTime_ms
+kClockIn = 0
+kInterval = 0
+kInit    max 0, (kInit - 1)
+
+endin

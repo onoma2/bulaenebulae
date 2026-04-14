@@ -1,0 +1,539 @@
+nebconfigbegin
+-B,2048
+-b,512
+sr,48000
+ksmps,32
+file,latching,rising
+record,latching,rising
+nebconfigend
+
+; Surely You Are Joking Mr, Hilbert — stereo delay with 4-tap Hilbert shifter clusters in the feedback loop,
+; final reverberant stage and several macros. Inspired by the demos of VIKHH X.
+;
+; Architecture:
+;   - one variable delay line per channel
+;   - 4 Hilbert-shifted taps per side
+;   - analog/digital tap-frequency interpolation with 8ms DigXfade retimes
+;   - post-delay saturation/diffusion block and guarded feedback loop
+;
+; Control map:
+;   start      [gkloopstart]     global — delay time center (50ms–2s)
+;   speed      [gkspeed]         global — stereo spread for delay time and shift targets
+;   pitch      [gkpitch]         global — bipolar feedback (±0.95)
+;   density    [gkdensity]       global — base Hilbert shift frequency law
+;   overlap    [gkoverlap]       global — Hilbert span / tap spread law
+;   blend      [gkblend]         global — Hilbert dry/shift mix per tap
+;   window     [gkwindow]        global — branch direction zone map for odd/even taps
+;   blend_alt  [gkblend_alt]     global — dry/wet
+;   start_alt  [gkloopstart_alt] global — delay engine mode crossfade
+;   freeze     [gkfreeze]        global — freeze input mute + force loop feedback to 1.0
+;   record     [gkrecord]        global — stereo normal / dual-mono-input routing
+;                                        when record=1, left input feeds both delay inputs,
+;                                        while feedback remains per-channel
+;   size       [gkloopsize]      global — post-delay diffusion amount (0=dry, 1=full allpass diffusion)
+;   record_alt [gkrecord_alt]    trigger — purge/clear delay write path
+
+giSine ftgen 0, 0, 8192, 10, 1
+
+; --- UDO: Hilbert Frequency Shifter ---
+; Applies a frequency shift using the Hilbert transform.
+; kDir: 1 for shift up, -1 for shift down
+; kMix: 0 for dry, 1 for fully shifted
+opcode HILBERT_SHIFT, a, akkk
+    ain, kFreq, kDir, kMix xin
+    
+    aReal, aImag hilbert ain
+    aSinQ poscil 1.0, a(kFreq), giSine, 0
+    aCosQ poscil 1.0, a(kFreq), giSine, 0.25
+    
+    aShifted = (aReal * aCosQ) - (aImag * aSinQ * a(kDir))
+    aout = ain * a(1.0 - kMix) + aShifted * a(kMix)
+    
+    xout aout
+endop
+
+; --- UDO: Digital Crossfade for Delay Time & Hilbert Parameters ---
+; Performs a rapid 8ms crossfade between old and new delay times, tap clusters, and frequency targets.
+opcode DigXfade, kkkkkkkkkkkk, kkkkkkkkkkkkkkkkk
+  kTarget, kTargetOv, kTargetDens, kDigRead, kDigOld, kDigNew, kDigOldOv, kDigNewOv, kDigOldDens, kDigNewDens, kDigQueued, kDigQueuedOv, kDigQueuedDens, kDigQueue, kDigX, kTargetTol, kDigStep xin
+
+  ; Trigger if any target (time, overlap, or density) changes significantly
+  if (abs(kTarget - kDigRead) > kTargetTol || abs(kTargetOv - kDigNewOv) > 0.01 || abs(kTargetDens - kDigNewDens) > 0.01) then
+    if (kDigX >= 1) then
+      kDigOld = kDigRead
+      kDigOldOv = kDigNewOv
+      kDigOldDens = kDigNewDens
+      kDigNew = kTarget
+      kDigNewOv = kTargetOv
+      kDigNewDens = kTargetDens
+      kDigX = 0
+    elseif (abs(kTarget - kDigNew) > kTargetTol || abs(kTargetOv - kDigNewOv) > 0.01 || abs(kTargetDens - kDigNewDens) > 0.01) then
+      kDigQueued = kTarget
+      kDigQueuedOv = kTargetOv
+      kDigQueuedDens = kTargetDens
+      kDigQueue = 1
+    endif
+  endif
+
+  kDigX min 1, (kDigX + kDigStep)
+
+  if (kDigX >= 1) then
+    kDigRead = kDigNew
+    if (kDigQueue == 1) then
+      kDigOld = kDigRead
+      kDigOldOv = kDigNewOv
+      kDigOldDens = kDigNewDens
+      kDigNew = kDigQueued
+      kDigNewOv = kDigQueuedOv
+      kDigNewDens = kDigQueuedDens
+      kDigQueue = 0
+      kDigX = 0
+    endif
+  endif
+
+  xout kDigRead, kDigOld, kDigNew, kDigOldOv, kDigNewOv, kDigOldDens, kDigNewDens, kDigQueued, kDigQueuedOv, kDigQueuedDens, kDigQueue, kDigX
+endop
+
+; --- UDO: Frequency Multiplier Calculator ---
+; Calculates 4-tap Hilbert frequency targets based on density and span.
+opcode CALC_FREQS, kkkk, kk
+    kDensN, kOv xin
+    
+    ; Shift frequency mapping (a_new-vikkh CELL law)
+    if kDensN <= 0.60 then
+        kBaseShift = (kDensN / 0.60) * 60.0
+    else
+        kDensHi = (kDensN - 0.60) / 0.40
+        kBaseShift = 60.0 + 940.0 * pow(kDensHi, 0.75)
+    endif
+
+    ; Bipolar Pitch (Span)
+    if kOv > 0.55 then
+        kOvHi = (kOv - 0.55) / 0.45
+        kSpan = 1.0 + (kOvHi * 99.0)
+    elseif kOv < 0.45 then
+        kOvLo = (0.45 - kOv) / 0.45
+        kSpan = 1.0 - (kOvLo * 0.99)
+    else
+        kSpan = 1.0
+    endif
+
+    kF1 = limit(kBaseShift, 0, 20000)
+    kF2 = limit(kBaseShift * kSpan, 0, 20000)
+    kF3 = limit(kBaseShift * (kSpan ^ 2), 0, 20000)
+    kF4 = limit(kBaseShift * (kSpan ^ 3), 0, 20000)
+    
+    xout kF1, kF2, kF3, kF4
+endop
+
+; --- UDO: Tap Position Calculator ---
+opcode GET_TAP_POS, kkkk, k
+    kOv xin
+    kPos1 = 0.25
+    kPos2 = 0.50
+    kPos3 = 0.75
+    kPos4 = 1.00
+    if kOv < 0.45 then
+        kOvLo = (0.45 - kOv) / 0.45
+        kPos1 = 0.25 - (kOvLo * 0.125)
+        kPos2 = 0.50 - (kOvLo * 0.250)
+        kPos3 = 0.75 - (kOvLo * 0.250)
+    endif
+    xout kPos1, kPos2, kPos3, kPos4
+endop
+
+; --- UDO: Allpass Diffusor ---
+; Uses a fixed gain coefficient (0 to 0.99) to calculate the correct RT60
+; for a given loop time, ensuring it acts as a proper Schroeder diffusor.
+opcode DIFFUSE_AP, a, akk
+    ain, kGain, klpt xin
+    ; Calculate RT60 based on desired feedback gain
+    kRvt = klpt * (-6.9077 / log(limit(kGain, 0.001, 0.999)))
+    aout valpass ain, kRvt, klpt, 0.5
+    xout aout
+endop
+
+instr 1
+
+iOutSatDrive = 1.15
+iOutSatTrim  = 0.90
+iOutHardLim  = 0.95
+kPurgeTime_sec init 0
+
+; --- Digital Crossfade State ---
+iCalcDelay init 0.05
+kDigReadL init iCalcDelay
+kDigOldL init iCalcDelay
+kDigNewL init iCalcDelay
+kDigOldOvL init 0.5
+kDigNewOvL init 0.5
+kDigOldDensL init 0.0
+kDigNewDensL init 0.0
+kDigQueuedL init iCalcDelay
+kDigQueuedOvL init 0.5
+kDigQueuedDensL init 0.0
+kDigQueueL init 0
+kDigXL init 1
+
+kDigReadR init iCalcDelay
+kDigOldR init iCalcDelay
+kDigNewR init iCalcDelay
+kDigOldOvR init 0.5
+kDigNewOvR init 0.5
+kDigOldDensR init 0.0
+kDigNewDensR init 0.0
+kDigQueuedR init iCalcDelay
+kDigQueuedOvR init 0.5
+kDigQueuedDensR init 0.0
+kDigQueueR init 0
+kDigXR init 1
+
+kTargetTol = 0.005 ; 5ms threshold to trigger a new digital crossfade
+kDigStep = 1 / (0.008 * kr) ; 8ms crossfade
+
+; --- Controls ---
+kSpeedCtlSm portk gkspeed, 0.05
+kSpeedStable init 0
+if (abs(kSpeedCtlSm) < 0.01) then
+    kSpeedStable = 0
+elseif (abs(kSpeedCtlSm - kSpeedStable) > 0.005) then
+    kSpeedStable = kSpeedCtlSm
+endif
+kSpread = limit(kSpeedStable, -1, 1)
+
+; Digital-time conditioning: smooth control motion, then apply a small deadband
+; so DigXfade only sees intentional target changes.
+kDelayCtlSm portk gkloopstart, 0.05
+kDelayCtlStable init 0
+if (abs(kDelayCtlSm - kDelayCtlStable) > (0.005 / 1.95)) then
+    kDelayCtlStable = kDelayCtlSm
+endif
+
+kDelayTimeCenter = (kDelayCtlStable * 1.95) + 0.05 ; 50ms to 2s
+kDelaySpreadDepth = 0.15
+kDelayTimeL  = limit(kDelayTimeCenter * (1.0 + (kSpread * kDelaySpreadDepth)), 0.05, 2.0)
+kDelayTimeR  = limit(kDelayTimeCenter * (1.0 - (kSpread * kDelaySpreadDepth)), 0.05, 2.0)
+
+kRawOverlap portk gkpitch, 0.05
+; Overlap controls bipolar feedback +/- 0.95
+kFeedback    = (limit(kRawOverlap, 0, 1) * 2 - 1) * 0.95 
+
+kShiftMix    portk gkblend, 0.05                     ; Hilbert mix per tap
+
+kRawWindow   portk gkwindow, 0.05
+kWinN        = limit(kRawWindow, 0, 1)
+
+; Window knob zones:
+; 0.00 - 0.25: Down Alternating (Odd Down, Even Up)
+; 0.25 - 0.50: All Down
+; 0.50 - 0.75: All Up
+; 0.75 - 1.00: Up Alternating (Odd Up, Even Down)
+if kWinN < 0.25 then
+    kShiftDirOdd  = -1
+    kShiftDirEven = 1
+elseif kWinN < 0.50 then
+    kShiftDirOdd  = -1
+    kShiftDirEven = -1
+elseif kWinN < 0.75 then
+    kShiftDirOdd  = 1
+    kShiftDirEven = 1
+else
+    kShiftDirOdd  = 1
+    kShiftDirEven = -1
+endif
+
+kRawBlendAlt portk gkblend_alt, 0.05
+kDryWet      = limit(kRawBlendAlt, 0, 1)             ; Global Dry/Wet on blend_alt
+
+; --- Hilbert & Pitch (Raw Targets for DigXfade) ---
+kDensCtlSm portk gkdensity, 0.05
+kDensNStable init 0
+if (abs(kDensCtlSm - kDensNStable) > 0.005) then
+    kDensNStable = kDensCtlSm
+endif
+kDensN = limit(kDensNStable, 0.0, 1.0)
+
+kOvCtlSm portk gkoverlap, 0.05
+kOvNStable init 0
+if (abs(kOvCtlSm - kOvNStable) > 0.005) then
+    kOvNStable = kOvCtlSm
+endif
+kOvN   = limit(kOvNStable, 0.0, 1.0)
+
+; Analog Path (Tape Slew)
+kDensL_ana portk kDensN, 0.05
+kOvL_ana   portk kOvN, 0.05
+kBaseCenter_ana = (kDensL_ana <= 0.60 ? (kDensL_ana / 0.60) * 60.0 : 60.0 + 940.0 * pow((kDensL_ana - 0.60) / 0.40, 0.75))
+kSpanCenter_ana = (kOvL_ana > 0.55 ? 1.0 + ((kOvL_ana - 0.55) / 0.45) * 99.0 : (kOvL_ana < 0.45 ? 1.0 - ((0.45 - kOvL_ana) / 0.45) * 0.99 : 1.0))
+kBaseSpreadDepth = 0.75
+kSpanSpreadDepth = 0.25
+kBaseL_ana = limit(kBaseCenter_ana * (1.0 - (kSpread * kBaseSpreadDepth)), 0, 20000)
+kBaseR_ana = limit(kBaseCenter_ana * (1.0 + (kSpread * kBaseSpreadDepth)), 0, 20000)
+kSpanL_ana = limit(kSpanCenter_ana * (1.0 + (kSpread * kSpanSpreadDepth)), 0.01, 100.0)
+kSpanR_ana = limit(kSpanCenter_ana * (1.0 - (kSpread * kSpanSpreadDepth)), 0.01, 100.0)
+
+kFreq1L_ana = limit(kBaseL_ana, 0, 20000)
+kFreq2L_ana = limit(kBaseL_ana * kSpanL_ana, 0, 20000)
+kFreq3L_ana = limit(kBaseL_ana * (kSpanL_ana ^ 2), 0, 20000)
+kFreq4L_ana = limit(kBaseL_ana * (kSpanL_ana ^ 3), 0, 20000)
+
+kFreq1R_ana = limit(kBaseR_ana, 0, 20000)
+kFreq2R_ana = limit(kBaseR_ana * kSpanR_ana, 0, 20000)
+kFreq3R_ana = limit(kBaseR_ana * (kSpanR_ana ^ 2), 0, 20000)
+kFreq4R_ana = limit(kBaseR_ana * (kSpanR_ana ^ 3), 0, 20000)
+
+; --- Input Stage ---
+aInL_live, aInR_live inch 1, 2
+
+#ifdef RUNNER_INPUT_FILE
+iFileChn filenchnls $RUNNER_INPUT_FILE
+if iFileChn > 1 then
+    aInL_file, aInR_file diskin2 $RUNNER_INPUT_FILE, 1, 0, 1
+else
+    aInL_file diskin2 $RUNNER_INPUT_FILE, 1, 0, 1
+    aInR_file = aInL_file
+endif
+aInL_raw = aInL_file
+aInR_raw = aInR_file
+#else
+aInL_raw = aInL_live
+aInR_raw = aInR_live
+#end
+
+aInL butterhp aInL_raw, 20
+aInR butterhp aInR_raw, 20
+
+afbL init 0
+afbR init 0
+denorm aInL, aInR, afbL, afbR
+
+; --- Freeze Slew (10ms) ---
+kFreeze portk gkfreeze, 0.01
+kPurgeTrig trigger gkrecord_alt, 0.5, 0
+if (kPurgeTrig == 1) then
+    kPurgeTime_sec = 2.6
+endif
+kPurgeTime_sec = (kPurgeTime_sec > 0 ? kPurgeTime_sec - (1 / kr) : 0)
+kPurgeTime_sec max 0, kPurgeTime_sec
+kPurgeActive = (kPurgeTime_sec > 0 ? 1 : 0)
+
+if (kFreeze > 0) then
+    ; In Freeze Mode, input is muted and feedback is forced to 1.0
+    aInL_fb = afbL * 1.0
+    aInR_fb = afbR * 1.0
+else
+    ; In Normal Mode, use the feedback knob and include live input
+    if (gkrecord == 1) then
+        aInL_fb = aInL + (afbL * kFeedback)
+        aInR_fb = aInL + (afbR * kFeedback)
+    else
+        aInL_fb = aInL + (afbL * kFeedback)
+        aInR_fb = aInR + (afbR * kFeedback)
+    endif
+endif
+
+; Input safety to prevent runaway before the delay line
+aInL_fb limit aInL_fb, -1.0, 1.0
+aInR_fb limit aInR_fb, -1.0, 1.0
+
+; --- Delay Mode Control (start_alt) ---
+; 0.0 = Analog Tape Slew (tonex)
+; 1.0 = Digital Crossfade (DigXfade)
+; Noon (0.5) is a 50/50 blend of both engines
+kRawMode portk gkloopstart_alt, 0.05
+kDigitalMode = limit(kRawMode, 0, 1)
+
+; --- Delay & Hilbert Stage (Left) ---
+kTargetL = kDelayTimeL
+
+; Digital State
+kDigReadL, kDigOldL, kDigNewL, kDigOldOvL, kDigNewOvL, kDigOldDensL, kDigNewDensL, kDigQueuedL, kDigQueuedOvL, kDigQueuedDensL, kDigQueueL, kDigXL \
+    DigXfade kTargetL, kOvN, kDensN, kDigReadL, kDigOldL, kDigNewL, kDigOldOvL, kDigNewOvL, kDigOldDensL, kDigNewDensL, kDigQueuedL, kDigQueuedOvL, kDigQueuedDensL, kDigQueueL, kDigXL, kTargetTol, kDigStep
+
+; Tap Positions for Digital Path
+kOldTap1L, kOldTap2L, kOldTap3L, kOldTap4L GET_TAP_POS kDigOldOvL
+kNewTap1L, kNewTap2L, kNewTap3L, kNewTap4L GET_TAP_POS kDigNewOvL
+
+; Frequencies for Digital Path
+kF1L_old, kF2L_old, kF3L_old, kF4L_old CALC_FREQS kDigOldDensL, kDigOldOvL
+kF1L_new, kF2L_new, kF3L_new, kF4L_new CALC_FREQS kDigNewDensL, kDigNewOvL
+
+kDigOldGainLk = cos(kDigXL * $M_PI_2)
+kDigNewGainLk = sin(kDigXL * $M_PI_2)
+
+kFreq1L_dig = (kF1L_old * kDigOldGainLk) + (kF1L_new * kDigNewGainLk)
+kFreq2L_dig = (kF2L_old * kDigOldGainLk) + (kF2L_new * kDigNewGainLk)
+kFreq3L_dig = (kF3L_old * kDigOldGainLk) + (kF3L_new * kDigNewGainLk)
+kFreq4L_dig = (kF4L_old * kDigOldGainLk) + (kF4L_new * kDigNewGainLk)
+
+; Final Frequencies (Blended)
+kFreq1L = (kFreq1L_ana * (1.0 - kDigitalMode)) + (kFreq1L_dig * kDigitalMode)
+kFreq2L = (kFreq2L_ana * (1.0 - kDigitalMode)) + (kFreq2L_dig * kDigitalMode)
+kFreq3L = (kFreq3L_ana * (1.0 - kDigitalMode)) + (kFreq3L_dig * kDigitalMode)
+kFreq4L = (kFreq4L_ana * (1.0 - kDigitalMode)) + (kFreq4L_dig * kDigitalMode)
+
+; Analog State
+aAnaTargetL tonex a(kTargetL), 12.0, 2
+kTap1L_ana, kTap2L_ana, kTap3L_ana, kTap4L_ana GET_TAP_POS kOvL_ana
+aTapPos1L interp kTap1L_ana
+aTapPos2L interp kTap2L_ana
+aTapPos3L interp kTap3L_ana
+aTapPos4L interp kTap4L_ana
+
+aDigXL interp kDigXL
+aDigOldGainL = cos(aDigXL * $M_PI_2)
+aDigNewGainL = sin(aDigXL * $M_PI_2)
+
+aBufL delayr 2.5
+
+aTap1L_old deltap3 limit(kDigOldL * kOldTap1L, 0.01, 2.0)
+aTap1L_new deltap3 limit(kDigNewL * kNewTap1L, 0.01, 2.0)
+aTap1L_dig = (aTap1L_old * aDigOldGainL) + (aTap1L_new * aDigNewGainL)
+aTap1L_ana deltap3 limit(aAnaTargetL * aTapPos1L, 0.01, 2.0)
+aTap1L = (aTap1L_ana * a(1.0 - kDigitalMode)) + (aTap1L_dig * a(kDigitalMode))
+
+aTap2L_old deltap3 limit(kDigOldL * kOldTap2L, 0.01, 2.0)
+aTap2L_new deltap3 limit(kDigNewL * kNewTap2L, 0.01, 2.0)
+aTap2L_dig = (aTap2L_old * aDigOldGainL) + (aTap2L_new * aDigNewGainL)
+aTap2L_ana deltap3 limit(aAnaTargetL * aTapPos2L, 0.01, 2.0)
+aTap2L = (aTap2L_ana * a(1.0 - kDigitalMode)) + (aTap2L_dig * a(kDigitalMode))
+
+aTap3L_old deltap3 limit(kDigOldL * kOldTap3L, 0.01, 2.0)
+aTap3L_new deltap3 limit(kDigNewL * kNewTap3L, 0.01, 2.0)
+aTap3L_dig = (aTap3L_old * aDigOldGainL) + (aTap3L_new * aDigNewGainL)
+aTap3L_ana deltap3 limit(aAnaTargetL * aTapPos3L, 0.01, 2.0)
+aTap3L = (aTap3L_ana * a(1.0 - kDigitalMode)) + (aTap3L_dig * a(kDigitalMode))
+
+aTap4L_old deltap3 limit(kDigOldL * kOldTap4L, 0.01, 2.0)
+aTap4L_new deltap3 limit(kDigNewL * kNewTap4L, 0.01, 2.0)
+aTap4L_dig = (aTap4L_old * aDigOldGainL) + (aTap4L_new * aDigNewGainL)
+aTap4L_ana deltap3 limit(aAnaTargetL * aTapPos4L, 0.01, 2.0)
+aTap4L = (aTap4L_ana * a(1.0 - kDigitalMode)) + (aTap4L_dig * a(kDigitalMode))
+
+       delayw ((1 - kPurgeActive) * aInL_fb)
+
+aShift1L HILBERT_SHIFT aTap1L, kFreq1L, kShiftDirOdd, kShiftMix
+aShift2L HILBERT_SHIFT aTap2L, kFreq2L, kShiftDirEven, kShiftMix
+aShift3L HILBERT_SHIFT aTap3L, kFreq3L, kShiftDirOdd, kShiftMix
+aShift4L HILBERT_SHIFT aTap4L, kFreq4L, kShiftDirEven, kShiftMix
+
+asigL = (aShift1L + aShift2L + aShift3L + aShift4L) * 0.5
+
+; --- Delay & Hilbert Stage (Right) ---
+kTargetR = kDelayTimeR
+
+; Digital State
+kDigReadR, kDigOldR, kDigNewR, kDigOldOvR, kDigNewOvR, kDigOldDensR, kDigNewDensR, kDigQueuedR, kDigQueuedOvR, kDigQueuedDensR, kDigQueueR, kDigXR \
+    DigXfade kTargetR, kOvN, kDensN, kDigReadR, kDigOldR, kDigNewR, kDigOldOvR, kDigNewOvR, kDigOldDensR, kDigNewDensR, kDigQueuedR, kDigQueuedOvR, kDigQueuedDensR, kDigQueueR, kDigXR, kTargetTol, kDigStep
+
+; Tap Positions for Digital Path
+kOldTap1R, kOldTap2R, kOldTap3R, kOldTap4R GET_TAP_POS kDigOldOvR
+kNewTap1R, kNewTap2R, kNewTap3R, kNewTap4R GET_TAP_POS kDigNewOvR
+
+; Frequencies for Digital Path
+kF1R_old, kF2R_old, kF3R_old, kF4R_old CALC_FREQS kDigOldDensR, kDigOldOvR
+kF1R_new, kF2R_new, kF3R_new, kF4R_new CALC_FREQS kDigNewDensR, kDigNewOvR
+
+kDigOldGainRk = cos(kDigXR * $M_PI_2)
+kDigNewGainRk = sin(kDigXR * $M_PI_2)
+
+kFreq1R_dig = (kF1R_old * kDigOldGainRk) + (kF1R_new * kDigNewGainRk)
+kFreq2R_dig = (kF2R_old * kDigOldGainRk) + (kF2R_new * kDigNewGainRk)
+kFreq3R_dig = (kF3R_old * kDigOldGainRk) + (kF3R_new * kDigNewGainRk)
+kFreq4R_dig = (kF4R_old * kDigOldGainRk) + (kF4R_new * kDigNewGainRk)
+
+; Final Frequencies (Blended)
+kFreq1R = (kFreq1R_ana * (1.0 - kDigitalMode)) + (kFreq1R_dig * kDigitalMode)
+kFreq2R = (kFreq2R_ana * (1.0 - kDigitalMode)) + (kFreq2R_dig * kDigitalMode)
+kFreq3R = (kFreq3R_ana * (1.0 - kDigitalMode)) + (kFreq3R_dig * kDigitalMode)
+kFreq4R = (kFreq4R_ana * (1.0 - kDigitalMode)) + (kFreq4R_dig * kDigitalMode)
+
+; Analog State
+aAnaTargetR tonex a(kTargetR), 12.0, 2
+kTap1R_ana, kTap2R_ana, kTap3R_ana, kTap4R_ana GET_TAP_POS kOvL_ana ; Same base overlap for both
+aTapPos1R interp kTap1R_ana
+aTapPos2R interp kTap2R_ana
+aTapPos3R interp kTap3R_ana
+aTapPos4R interp kTap4R_ana
+
+aDigXR interp kDigXR
+aDigOldGainR = cos(aDigXR * $M_PI_2)
+aDigNewGainR = sin(aDigXR * $M_PI_2)
+
+aBufR delayr 2.5
+
+aTap1R_old deltap3 limit(kDigOldR * kOldTap1R, 0.01, 2.0)
+aTap1R_new deltap3 limit(kDigNewR * kNewTap1R, 0.01, 2.0)
+aTap1R_dig = (aTap1R_old * aDigOldGainR) + (aTap1R_new * aDigNewGainR)
+aTap1R_ana deltap3 limit(aAnaTargetR * aTapPos1R, 0.01, 2.0)
+aTap1R = (aTap1R_ana * a(1.0 - kDigitalMode)) + (aTap1R_dig * a(kDigitalMode))
+
+aTap2R_old deltap3 limit(kDigOldR * kOldTap2R, 0.01, 2.0)
+aTap2R_new deltap3 limit(kDigNewR * kNewTap2R, 0.01, 2.0)
+aTap2R_dig = (aTap2R_old * aDigOldGainR) + (aTap2R_new * aDigNewGainR)
+aTap2R_ana deltap3 limit(aAnaTargetR * aTapPos2R, 0.01, 2.0)
+aTap2R = (aTap2R_ana * a(1.0 - kDigitalMode)) + (aTap2R_dig * a(kDigitalMode))
+
+aTap3R_old deltap3 limit(kDigOldR * kOldTap3R, 0.01, 2.0)
+aTap3R_new deltap3 limit(kDigNewR * kNewTap3R, 0.01, 2.0)
+aTap3R_dig = (aTap3R_old * aDigOldGainR) + (aTap3R_new * aDigNewGainR)
+aTap3R_ana deltap3 limit(aAnaTargetR * aTapPos3R, 0.01, 2.0)
+aTap3R = (aTap3R_ana * a(1.0 - kDigitalMode)) + (aTap3R_dig * a(kDigitalMode))
+
+aTap4R_old deltap3 limit(kDigOldR * kOldTap4R, 0.01, 2.0)
+aTap4R_new deltap3 limit(kDigNewR * kNewTap4R, 0.01, 2.0)
+aTap4R_dig = (aTap4R_old * aDigOldGainR) + (aTap4R_new * aDigNewGainR)
+aTap4R_ana deltap3 limit(aAnaTargetR * aTapPos4R, 0.01, 2.0)
+aTap4R = (aTap4R_ana * a(1.0 - kDigitalMode)) + (aTap4R_dig * a(kDigitalMode))
+
+       delayw ((1 - kPurgeActive) * aInR_fb)
+
+aShift1R HILBERT_SHIFT aTap1R, kFreq1R, kShiftDirOdd, kShiftMix
+aShift2R HILBERT_SHIFT aTap2R, kFreq2R, kShiftDirEven, kShiftMix
+aShift3R HILBERT_SHIFT aTap3R, kFreq3R, kShiftDirOdd, kShiftMix
+aShift4R HILBERT_SHIFT aTap4R, kFreq4R, kShiftDirEven, kShiftMix
+
+asigR = (aShift1R + aShift2R + aShift3R + aShift4R) * 0.5
+
+; --- Saturation and Diffusion (Size knob) ---
+asigL = tanh(asigL)
+asigR = tanh(asigR)
+
+kRawSize portk gkloopsize, 0.05
+kDiffAmt = limit(kRawSize, 0, 1)
+
+; Calculate a safe Schroeder allpass gain (0.4 to 0.72) for a dense, ringing-free smear
+kDiffGain = 0.4 + (kDiffAmt * 0.32)
+
+aDiffL DIFFUSE_AP asigL, kDiffGain, 0.113
+aDiffL DIFFUSE_AP aDiffL, kDiffGain, 0.167
+aDiffL DIFFUSE_AP aDiffL, kDiffGain, 0.227
+aDiffL DIFFUSE_AP aDiffL, kDiffGain, 0.311
+
+aDiffR DIFFUSE_AP asigR, kDiffGain, 0.131
+aDiffR DIFFUSE_AP aDiffR, kDiffGain, 0.173
+aDiffR DIFFUSE_AP aDiffR, kDiffGain, 0.233
+aDiffR DIFFUSE_AP aDiffR, kDiffGain, 0.317
+
+asigL = (asigL * (1 - kDiffAmt)) + (aDiffL * kDiffAmt)
+asigR = (asigR * (1 - kDiffAmt)) + (aDiffR * kDiffAmt)
+
+; --- Feedback update ---
+afbL butterhp asigL, 20
+afbR butterhp asigR, 20
+
+; --- Dry/wet ---
+aOutL = (aInL * (1 - kDryWet)) + (asigL * kDryWet)
+aOutR = (aInR * (1 - kDryWet)) + (asigR * kDryWet)
+
+; --- Mandatory Output Protection ---
+aOutL dcblock2 aOutL
+aOutR dcblock2 aOutR
+aOutL = tanh(aOutL * iOutSatDrive) * iOutSatTrim
+aOutR = tanh(aOutR * iOutSatDrive) * iOutSatTrim
+aOutL limit aOutL, -iOutHardLim, iOutHardLim
+aOutR limit aOutR, -iOutHardLim, iOutHardLim
+
+outs aOutL, aOutR
+
+endin
